@@ -29,13 +29,41 @@ class CNNGui:
         tk.Label(self.left_frame, text="Training Panel",
                  font=("Arial", 16, "bold")).pack(pady=10)
 
+        # Hidden Layers
         tk.Label(self.left_frame, text="Hidden Layers:").pack()
-        self.hidden_layers_entry = tk.Entry(self.left_frame)
+
+        self.hidden_layers_var = tk.StringVar()
+        self.hidden_layers_entry = tk.Entry(self.left_frame, textvariable=self.hidden_layers_var)
         self.hidden_layers_entry.pack(pady=5)
 
+        self.hidden_layers_error = tk.Label(
+            self.left_frame,
+            text="Only numbers allowed",
+            fg="red"
+        )
+        self.hidden_layers_error.pack()
+        self.hidden_layers_error.pack_forget()  # hide initially
+
+        # Live validation
+        self.hidden_layers_var.trace_add("write", self.validate_number_only)
+
+
         tk.Label(self.left_frame, text="Epochs:").pack()
-        self.epochs_entry = tk.Entry(self.left_frame)
+        
+        self.epochs_var = tk.StringVar()
+        self.epochs_entry = tk.Entry(self.left_frame, textvariable=self.epochs_var)
         self.epochs_entry.pack(pady=5)
+
+        self.epochs_error = tk.Label(
+            self.left_frame,
+            text="Only numbers allowed",
+            fg="red"
+        )
+        self.epochs_error.pack()
+        self.epochs_error.pack_forget()  # hide initially
+
+        # Live validation
+        self.epochs_var.trace_add("write", self.validate_number_only)
 
         tk.Button(self.left_frame, text="Load Dataset",
                   command=self.load_dataset).pack(pady=10)
@@ -233,6 +261,18 @@ class CNNGui:
             text=f"Prediction: {fake_prediction}")
         self.certainty_label.config(
             text=f"Certainty: {fake_certainty} %")
+        
+    def validate_number_only(self, *args):
+        value = self.hidden_layers_var.get()
+
+        if value == "":
+            self.hidden_layers_error.pack_forget()
+            return
+
+        if not value.isdigit():
+            self.hidden_layers_error.pack()
+        else:
+            self.hidden_layers_error.pack_forget()
 
 
 if __name__ == "__main__":
