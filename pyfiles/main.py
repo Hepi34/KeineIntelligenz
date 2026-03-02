@@ -30,38 +30,40 @@ class CNNGui:
                  font=("Arial", 16, "bold")).pack(pady=10)
 
         # Hidden Layers
-        tk.Label(self.left_frame, text="Hidden Layers:").pack()
+        hidden_layers_label = tk.Label(self.left_frame, text="Hidden Layers:")
+        hidden_layers_label.pack()
 
         self.hidden_layers_var = tk.StringVar()
-        self.hidden_layers_entry = tk.Entry(self.left_frame, textvariable=self.hidden_layers_var)
+        self.hidden_layers_entry = tk.Entry(self.left_frame, textvariable=self.hidden_layers_var, width=30)
         self.hidden_layers_entry.pack(pady=5)
 
         self.hidden_layers_error = tk.Label(
             self.left_frame,
-            text="Only numbers allowed",
-            fg="red"
+            text="",
+            fg="red",
+            height=1
         )
         self.hidden_layers_error.pack()
-        self.hidden_layers_error.pack_forget()  # hide initially
 
         # Live validation
         self.hidden_layers_var.trace_add("write", lambda *args: self.validate_number_field(
             self.hidden_layers_var, self.hidden_layers_error))
 
         # Epochs
-        tk.Label(self.left_frame, text="Epochs:").pack()
+        epochs_label = tk.Label(self.left_frame, text="Epochs:")
+        epochs_label.pack()
         
         self.epochs_var = tk.StringVar()
-        self.epochs_entry = tk.Entry(self.left_frame, textvariable=self.epochs_var)
+        self.epochs_entry = tk.Entry(self.left_frame, textvariable=self.epochs_var, width=30)
         self.epochs_entry.pack(pady=5)
 
         self.epochs_error = tk.Label(
             self.left_frame,
-            text="Only numbers allowed",
-            fg="red"
+            text="",
+            fg="red",
+            height=1
         )
         self.epochs_error.pack()
-        self.epochs_error.pack_forget()  # hide initially
 
         # Live validation
         self.epochs_var.trace_add("write", lambda *args: self.validate_number_field(
@@ -70,8 +72,14 @@ class CNNGui:
         tk.Button(self.left_frame, text="Load Dataset",
                   command=self.load_dataset).pack(pady=10)
 
+        self.dataset_label = tk.Label(self.left_frame, text="No dataset loaded", fg="gray", wraplength=200)
+        self.dataset_label.pack(pady=5)
+
         tk.Button(self.left_frame, text="Load Labels",
                   command=self.load_labels).pack(pady=10)
+
+        self.labels_label = tk.Label(self.left_frame, text="No labels loaded", fg="gray", wraplength=200)
+        self.labels_label.pack(pady=5)
 
         tk.Button(self.left_frame, text="Train Model",
                   command=self.train_model).pack(pady=20)
@@ -118,10 +126,26 @@ class CNNGui:
     # STUB FUNCTIONS
     # -----------------------------
     def load_dataset(self):
-      return
+        file_path = filedialog.askopenfilename(
+            title="Select Dataset File",
+            filetypes=[("All files", "*.*"), ("NumPy files", "*.npy"), ("Ubyte files", "*.ubyte")]
+        )
+        if file_path:
+            self.dataset_path = file_path
+            # Show just the filename, or the full path if you prefer
+            filename = file_path.split("/")[-1]
+            self.dataset_label.config(text=f"✓ {filename}", fg="green")
 
     def load_labels(self):
-       return
+        file_path = filedialog.askopenfilename(
+            title="Select Labels File",
+            filetypes=[("All files", "*.*"), ("NumPy files", "*.npy"), ("Ubyte files", "*.ubyte")]
+        )
+        if file_path:
+            self.labels_path = file_path
+            # Show just the filename, or the full path if you prefer
+            filename = file_path.split("/")[-1]
+            self.labels_label.config(text=f"✓ {filename}", fg="green")
     
     def train_model(self):
         return
@@ -243,14 +267,10 @@ class CNNGui:
     def validate_number_field(self, var, error_label):
         value = var.get()
 
-        if value == "":
-            error_label.pack_forget()
-            return
-
-        if not value.isdigit():
-            error_label.pack()
+        if value == "" or value.isdigit():
+            error_label.config(text="")
         else:
-            error_label.pack_forget()
+            error_label.config(text="Only numbers allowed")
 
 
 if __name__ == "__main__":
