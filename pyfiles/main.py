@@ -2,10 +2,7 @@ from importlib.resources import path
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
-import random
-import threading
-import numpy as np
-import cnn_backend as cnn
+
 
 class CNNGui:
     def __init__(self, root):
@@ -121,74 +118,18 @@ class CNNGui:
     # STUB FUNCTIONS
     # -----------------------------
     def load_dataset(self):
-        path = filedialog.askopenfilename(filetypes=[("NumPy files", "*.npy *.npz")])
-        if not path:
-            return
-        self.dataset_path = path
-        self.X = cnn.load_array(path)
-        messagebox.showinfo("Dataset", f"Dataset geladen: {path}\nShape: {np.array(self.X).shape}")
+      return
 
     def load_labels(self):
-        path = filedialog.askopenfilename(filetypes=[("NumPy files", "*.npy *.npz")])
-        if not path:
-            return
-        self.labels_path = path
-        self.y = cnn.load_array(path)
-        messagebox.showinfo("Labels", f"Labels geladen: {path}\nShape: {np.array(self.y).shape}")
-
+       return
+    
     def train_model(self):
-        if not hasattr(self, "X") or not hasattr(self, "y"):
-            messagebox.showerror("Fehler", "Bitte zuerst Dataset und Labels laden.")
-            return
-
-        hidden_layers = int(self.hidden_layers_entry.get() or 1)
-        epochs = int(self.epochs_entry.get() or 10)
-
-        self.progress["value"] = 0
-        self.training_status.config(text="Training...", fg="black")
-
-        def on_progress(p):
-            self.root.after(0, lambda: self.progress.configure(value=p))
-
-        def on_status(txt):
-            self.root.after(0, lambda: self.training_status.config(text=txt, fg="black"))
-
-        def worker():
-            try:
-                self.model = cnn.train_model(
-                    self.X, self.y,
-                    hidden_layers=hidden_layers,
-                    epochs=epochs,
-                    on_progress=on_progress,
-                    on_status=on_status,
-                )
-
-                self.root.after(0, lambda: self.training_status.config(
-                    text="Training fertig ✅", fg="green"))
-
-            except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror(
-                    "Training Fehler", str(e)))
-
-        threading.Thread(target=worker, daemon=True).start()
+        return
 
 
 
     def load_model(self):
-        path = filedialog.askopenfilename(
-            filetypes=[("Keras model", "*.keras *.h5")]
-        )
-        if not path:
-            return
-
-        try:
-            self.model = cnn.load_model(path)
-            self.model_status_label.config(
-                text="Model Loaded Successfully ✅",
-                fg="green"
-            )
-        except Exception as e:
-            messagebox.showerror("Load Model Fehler", str(e))
+        return
 
     def load_sample(self):
         filedialog.askopenfilename()
@@ -297,27 +238,7 @@ class CNNGui:
         self.certainty_label.config(text="Certainty: - %")
 
     def update_prediction(self):
-        if not hasattr(self, "model"):
-            self.prediction_label.config(
-                text="Prediction: (kein Modell)")
-            self.certainty_label.config(
-                text="Certainty: - %")
-            return
-
-        try:
-            digit, certainty, _ = cnn.predict_digit(
-                self.model, self.pixels)
-
-            self.prediction_label.config(
-                text=f"Prediction: {digit}")
-            self.certainty_label.config(
-                text=f"Certainty: {certainty:.2f} %")
-
-        except Exception as e:
-            self.prediction_label.config(
-                text="Prediction: Fehler")
-            self.certainty_label.config(
-                text=str(e))
+        return
         
     def validate_number_field(self, var, error_label):
         value = var.get()
