@@ -45,9 +45,10 @@ class CNNGui:
         self.hidden_layers_error.pack_forget()  # hide initially
 
         # Live validation
-        self.hidden_layers_var.trace_add("write", self.validate_number_only)
+        self.hidden_layers_var.trace_add("write", lambda *args: self.validate_number_field(
+            self.hidden_layers_var, self.hidden_layers_error))
 
-
+        # Epochs
         tk.Label(self.left_frame, text="Epochs:").pack()
         
         self.epochs_var = tk.StringVar()
@@ -63,7 +64,8 @@ class CNNGui:
         self.epochs_error.pack_forget()  # hide initially
 
         # Live validation
-        self.epochs_var.trace_add("write", self.validate_number_only)
+        self.epochs_var.trace_add("write", lambda *args: self.validate_number_field(
+            self.epochs_var, self.epochs_error))
 
         tk.Button(self.left_frame, text="Load Dataset",
                   command=self.load_dataset).pack(pady=10)
@@ -262,17 +264,17 @@ class CNNGui:
         self.certainty_label.config(
             text=f"Certainty: {fake_certainty} %")
         
-    def validate_number_only(self, *args):
-        value = self.hidden_layers_var.get()
+    def validate_number_field(self, var, error_label):
+        value = var.get()
 
         if value == "":
-            self.hidden_layers_error.pack_forget()
+            error_label.pack_forget()
             return
 
         if not value.isdigit():
-            self.hidden_layers_error.pack()
+            error_label.pack()
         else:
-            self.hidden_layers_error.pack_forget()
+            error_label.pack_forget()
 
 
 if __name__ == "__main__":
