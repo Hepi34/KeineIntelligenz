@@ -1,22 +1,22 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox
+from tkinter import ttk
 import random
+
 
 class CNNGui:
     def __init__(self, root):
         self.root = root
-        self.root.title("MNIST CNN Trainer")
-        self.root.geometry("1000x600")
+        self.root.title("Keine Intelligenz by Hepi34, Onatic07 and fritziii")
+        self.root.geometry("1100x650")
 
-        # Main container
         self.main_frame = tk.Frame(root)
         self.main_frame.pack(fill="both", expand=True)
 
-        # Split left / right
-        self.left_frame = tk.Frame(self.main_frame, padx=20, pady=20)
+        self.left_frame = tk.Frame(self.main_frame, padx=30, pady=30)
         self.left_frame.pack(side="left", fill="both", expand=True)
 
-        self.right_frame = tk.Frame(self.main_frame, padx=20, pady=20)
+        self.right_frame = tk.Frame(self.main_frame, padx=30, pady=30)
         self.right_frame.pack(side="right", fill="both", expand=True)
 
         self.build_left_panel()
@@ -26,7 +26,8 @@ class CNNGui:
     # LEFT PANEL (Training)
     # -----------------------------
     def build_left_panel(self):
-        tk.Label(self.left_frame, text="Training Panel", font=("Arial", 16, "bold")).pack(pady=10)
+        tk.Label(self.left_frame, text="Training Panel",
+                 font=("Arial", 16, "bold")).pack(pady=10)
 
         tk.Label(self.left_frame, text="Hidden Layers:").pack()
         self.hidden_layers_entry = tk.Entry(self.left_frame)
@@ -36,25 +37,52 @@ class CNNGui:
         self.epochs_entry = tk.Entry(self.left_frame)
         self.epochs_entry.pack(pady=5)
 
-        tk.Button(self.left_frame, text="Load Dataset", command=self.load_dataset).pack(pady=10)
-        tk.Button(self.left_frame, text="Load Labels", command=self.load_labels).pack(pady=10)
-        tk.Button(self.left_frame, text="Train Model", command=self.train_model).pack(pady=20)
+        tk.Button(self.left_frame, text="Load Dataset",
+                  command=self.load_dataset).pack(pady=10)
+
+        tk.Button(self.left_frame, text="Load Labels",
+                  command=self.load_labels).pack(pady=10)
+
+        tk.Button(self.left_frame, text="Train Model",
+                  command=self.train_model).pack(pady=20)
+
+        # Progress Bar
+        tk.Label(self.left_frame, text="Training Progress:").pack(pady=(20, 5))
+        self.progress = ttk.Progressbar(
+            self.left_frame,
+            orient="horizontal",
+            length=250,
+            mode="determinate"
+        )
+        self.progress.pack(pady=5)
+
+        self.training_status = tk.Label(self.left_frame, text="")
+        self.training_status.pack(pady=5)
 
     # -----------------------------
     # RIGHT PANEL (Inference)
     # -----------------------------
     def build_right_panel(self):
-        tk.Label(self.right_frame, text="Inference Panel", font=("Arial", 16, "bold")).pack(pady=10)
+        tk.Label(self.right_frame, text="Inference Panel",
+                 font=("Arial", 16, "bold")).pack(pady=10)
 
-        tk.Button(self.right_frame, text="Load Model", command=self.load_model).pack(pady=10)
-        tk.Button(self.right_frame, text="Load Sample", command=self.load_sample).pack(pady=10)
-        tk.Button(self.right_frame, text="Load Sample Labels", command=self.load_sample_labels).pack(pady=10)
-        tk.Button(self.right_frame, text="Check Accuracy", command=self.check_accuracy).pack(pady=20)
+        tk.Button(self.right_frame, text="Load Model",
+                  command=self.load_model).pack(pady=10)
 
-        tk.Button(self.right_frame, text="Open Drawing Area", command=self.open_drawing_window).pack(pady=20)
+        self.model_status_label = tk.Label(self.right_frame, text="")
+        self.model_status_label.pack(pady=5)
 
-        self.prediction_label = tk.Label(self.right_frame, text="Prediction: -", font=("Arial", 14))
-        self.prediction_label.pack(pady=10)
+        tk.Button(self.right_frame, text="Load Sample",
+                  command=self.load_sample).pack(pady=10)
+
+        tk.Button(self.right_frame, text="Load Sample Labels",
+                  command=self.load_sample_labels).pack(pady=10)
+
+        tk.Button(self.right_frame, text="Check Accuracy",
+                  command=self.check_accuracy).pack(pady=20)
+
+        tk.Button(self.right_frame, text="Open Drawing Area",
+                  command=self.open_drawing_window).pack(pady=20)
 
     # -----------------------------
     # STUB FUNCTIONS
@@ -68,13 +96,27 @@ class CNNGui:
         print("Labels loaded (stub)")
 
     def train_model(self):
-        layers = self.hidden_layers_entry.get()
-        epochs = self.epochs_entry.get()
-        print(f"Training with {layers} layers for {epochs} epochs (stub)")
+        epochs = int(self.epochs_entry.get() or 10)
+
+        self.progress["value"] = 0
+        self.training_status.config(text="Training...")
+
+        def simulate_training(step=0):
+            if step <= 100:
+                self.progress["value"] = step
+                self.root.after(50, simulate_training, step + 2)
+            else:
+                self.training_status.config(
+                    text="Training complete (stub)", fg="green")
+
+        simulate_training()
 
     def load_model(self):
         filedialog.askopenfilename()
-        print("Model loaded (stub)")
+        self.model_status_label.config(
+            text="Model Loaded Successfully (stub)",
+            fg="green"
+        )
 
     def load_sample(self):
         filedialog.askopenfilename()
@@ -85,7 +127,6 @@ class CNNGui:
         print("Sample labels loaded (stub)")
 
     def check_accuracy(self):
-        print("Accuracy checked (stub)")
         messagebox.showinfo("Accuracy", "Accuracy: 0.00% (stub)")
 
     # -----------------------------
@@ -93,31 +134,72 @@ class CNNGui:
     # -----------------------------
     def open_drawing_window(self):
         self.draw_window = tk.Toplevel(self.root)
-        self.draw_window.title("Draw Digit (15x15)")
+        self.draw_window.title("Draw Digit (10x15 Grid)")
 
-        self.grid_size = 15
-        self.cell_size = 25
+        self.cols = 10
+        self.rows = 15
+        self.cell_size = 30
+
+        canvas_width = self.cols * self.cell_size
+        canvas_height = self.rows * self.cell_size
 
         self.canvas = tk.Canvas(
             self.draw_window,
-            width=self.grid_size * self.cell_size,
-            height=self.grid_size * self.cell_size,
-            bg="white"
+            width=canvas_width,
+            height=canvas_height,
+            bg="white",
+            highlightthickness=2,
+            highlightbackground="black"
         )
-        self.canvas.pack()
+        self.canvas.pack(pady=10)
 
-        self.pixels = [[0 for _ in range(self.grid_size)] for _ in range(self.grid_size)]
+        self.pixels = [[0 for _ in range(self.cols)]
+                       for _ in range(self.rows)]
+
+        self.draw_grid()
 
         self.canvas.bind("<Button-1>", self.toggle_pixel)
 
-        tk.Button(self.draw_window, text="Clear", command=self.clear_canvas).pack(pady=10)
+        # Space under drawing area
+        tk.Label(self.draw_window, text="").pack()
+
+        self.prediction_label = tk.Label(
+            self.draw_window,
+            text="Prediction: -",
+            font=("Arial", 14, "bold")
+        )
+        self.prediction_label.pack(pady=5)
+
+        self.certainty_label = tk.Label(
+            self.draw_window,
+            text="Certainty: - %",
+            font=("Arial", 12)
+        )
+        self.certainty_label.pack(pady=5)
+
+        tk.Button(self.draw_window, text="Clear",
+                  command=self.clear_canvas).pack(pady=10)
+
+    def draw_grid(self):
+        for row in range(self.rows):
+            for col in range(self.cols):
+                x1 = col * self.cell_size
+                y1 = row * self.cell_size
+                x2 = x1 + self.cell_size
+                y2 = y1 + self.cell_size
+
+                self.canvas.create_rectangle(
+                    x1, y1, x2, y2,
+                    fill="white",
+                    outline="#cccccc"  # subtle grey lines
+                )
 
     def toggle_pixel(self, event):
         col = event.x // self.cell_size
         row = event.y // self.cell_size
 
-        if 0 <= row < self.grid_size and 0 <= col < self.grid_size:
-            self.pixels[row][col] ^= 1  # toggle
+        if 0 <= row < self.rows and 0 <= col < self.cols:
+            self.pixels[row][col] ^= 1
 
             x1 = col * self.cell_size
             y1 = row * self.cell_size
@@ -125,19 +207,32 @@ class CNNGui:
             y2 = y1 + self.cell_size
 
             color = "black" if self.pixels[row][col] else "white"
-            self.canvas.create_rectangle(x1, y1, x2, y2, fill=color, outline="gray")
+
+            self.canvas.create_rectangle(
+                x1, y1, x2, y2,
+                fill=color,
+                outline="#cccccc"
+            )
 
             self.update_prediction()
 
     def clear_canvas(self):
         self.canvas.delete("all")
-        self.pixels = [[0 for _ in range(self.grid_size)] for _ in range(self.grid_size)]
+        self.pixels = [[0 for _ in range(self.cols)]
+                       for _ in range(self.rows)]
+        self.draw_grid()
         self.prediction_label.config(text="Prediction: -")
+        self.certainty_label.config(text="Certainty: - %")
 
     def update_prediction(self):
         # Stub prediction
         fake_prediction = random.randint(0, 9)
-        self.prediction_label.config(text=f"Prediction: {fake_prediction}")
+        fake_certainty = round(random.uniform(70, 99), 2)
+
+        self.prediction_label.config(
+            text=f"Prediction: {fake_prediction}")
+        self.certainty_label.config(
+            text=f"Certainty: {fake_certainty} %")
 
 
 if __name__ == "__main__":
