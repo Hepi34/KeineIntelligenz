@@ -2,6 +2,8 @@ from importlib.resources import path
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
+import threading
+from train_cnn_cpu import train_cnn, save_model
 
 
 class CNNGui:
@@ -9,6 +11,10 @@ class CNNGui:
         self.root = root
         self.root.title("Keine Intelligenz by Hepi34, Onatic07 and fritziii")
         self.root.geometry("1100x650")
+
+        self.dataset_path = None
+        self.labels_path = None
+        self.model = None
 
         self.main_frame = tk.Frame(root)
         self.main_frame.pack(fill="both", expand=True)
@@ -81,8 +87,9 @@ class CNNGui:
         self.labels_label = tk.Label(self.left_frame, text="No labels loaded", fg="gray", wraplength=200)
         self.labels_label.pack(pady=5)
 
-        tk.Button(self.left_frame, text="Train Model",
-                  command=self.train_model).pack(pady=20)
+        self.train_button = tk.Button(self.left_frame, text="Train Model",
+                  command=self.train_model)
+        self.train_button.pack(pady=20)
 
         # Progress Bar
         tk.Label(self.left_frame, text="Training Progress:").pack(pady=(20, 5))
@@ -148,7 +155,66 @@ class CNNGui:
             self.labels_label.config(text=f"✓ {filename}", fg="green")
     
     def train_model(self):
-        return
+        # Validate inputs
+        if not self.dataset_path:
+            messagebox.showerror("Error", "Please load a dataset first")
+            return
+        if not self.labels_path:
+            messagebox.showerror("Error", "Please load labels first")
+            return
+        
+        epochs_str = self.epochs_entry.get()
+        hidden_layers_str = self.hidden_layers_entry.get()
+        
+        if not epochs_str or not epochs_str.isdigit():
+            messagebox.showerror("Error", "Please enter a valid number for epochs")
+            return
+        if not hidden_layers_str or not hidden_layers_str.isdigit():
+            messagebox.showerror("Error", "Please enter a valid number for hidden layers")
+            return
+        
+        epochs = int(epochs_str)
+        hidden_layers = int(hidden_layers_str)
+        
+        # Disable train button during training
+        self.train_button.config(state="disabled")
+        self.progress["value"] = 0
+        self.training_status.config(text="Training in progress...", fg="blue")
+        self.root.update()
+        
+        def run_training():
+            try:
+                def progress_callback(current_epoch, total_epochs, loss):
+                    progress = (current_epoch / total_epochs) * 100
+                    self.progress["value"] = progress
+                    self.training_status.config(
+                        text=f"Epoch {current_epoch}/{total_epochs}, Loss: {loss:.4f}",
+                        fg="blue"
+                    )
+                    self.root.update()
+                
+                self.model = train_cnn(
+                    self.dataset_path,
+                    self.labels_path,
+                    epochs=epochs,
+                    hidden_layers=hidden_layers,
+                    callback=progress_callback
+                )
+                
+                # Save model
+                save_model(self.model, "cnn_model.pkl")
+                
+                self.progress["value"] = 100
+                self.training_status.config(text="Training complete! Model saved as cnn_model.pkl", fg="green")
+            except Exception as e:
+                self.training_status.config(text=f"Error: {str(e)}", fg="red")
+                messagebox.showerror("Training Error", str(e))
+            finally:
+                self.train_button.config(state="normal")
+        
+        # Run training in background thread
+        training_thread = threading.Thread(target=run_training, daemon=True)
+        training_thread.start()
 
 
 
