@@ -62,8 +62,13 @@ class OpenCLManager:
         if cl is None:
             raise RuntimeError("PyOpenCL is not available.")
         host = np.ascontiguousarray(array)
-        flags = cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR
-        return cl.Buffer(self.context, flags, hostbuf=host)
+        # Allocate buffer WITHOUT relying on COPY_HOST_PTR, which may have issues
+        flags = cl.mem_flags.READ_WRITE
+        buffer = cl.Buffer(self.context, flags, size=host.nbytes)
+        # Explicitly copy data using enqueue_copy
+        cl.enqueue_copy(self.queue, buffer, host)
+        self.queue.finish()
+        return buffer
 
     def empty_device(self, shape: tuple[int, ...], dtype: np.dtype[Any]) -> Any:
         """Allocate an empty GPU buffer matching shape/dtype."""

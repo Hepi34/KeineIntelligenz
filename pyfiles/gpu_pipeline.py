@@ -58,6 +58,10 @@ __kernel void conv2d_forward_nchw(
     const int n = get_global_id(0);
     const int co = get_global_id(1);
     const int flat = get_global_id(2);
+    // Launch-shape sanity: host is expected to launch exactly (N, Cout, OH*OW).
+    // Keep bounds checks regardless to avoid OOB access with mismatched global sizes.
+    if ((int)get_global_size(0) < N || (int)get_global_size(1) < Cout || (int)get_global_size(2) < OH * OW) return;
+    if (N <= 0 || Cin <= 0 || H <= 0 || W <= 0 || Cout <= 0 || K <= 0 || OH <= 0 || OW <= 0) return;
     if (n >= N || co >= Cout || flat >= OH * OW) return;
 
     const int oh = flat / OW;
@@ -65,25 +69,41 @@ __kernel void conv2d_forward_nchw(
     const int h0 = oh * stride - padding;
     const int w0 = ow * stride - padding;
 
-    float acc = b[co];
+    const int x_total = N * Cin * H * W;
+    const int w_total = Cout * Cin * K * K;
+    const int out_total = N * Cout * OH * OW;
+
+    // Start from zeroed accumulator; each output is computed from scratch.
+    float value = 0.0f;
+    if (co >= 0 && co < Cout) {
+        value += b[co];
+    }
+
     for (int ci = 0; ci < Cin; ++ci) {
         for (int kh = 0; kh < K; ++kh) {
             for (int kw = 0; kw < K; ++kw) {
                 const int ih = h0 + kh;
                 const int iw = w0 + kw;
                 if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
-                    const int x_idx = ((n * Cin + ci) * H + ih) * W + iw;
+                    // NCHW linear index: n*C*H*W + c*H*W + h*W + w
+                    const int x_idx = n * (Cin * H * W) + ci * (H * W) + ih * W + iw;
                     const int w_idx = ((co * Cin + ci) * K + kh) * K + kw;
-                    acc += x[x_idx] * w[w_idx];
+                    if (x_idx >= 0 && x_idx < x_total && w_idx >= 0 && w_idx < w_total) {
+                        value += x[x_idx] * w[w_idx];
+                    }
                 }
             }
         }
     }
+
+    if (!isfinite(value)) value = 0.0f;
+    if (value > 1e6f) value = 1e6f;
+    if (value < -1e6f) value = -1e6f;
+
     const int out_idx = ((n * Cout + co) * OH + oh) * OW + ow;
-    if (!isfinite(acc)) acc = 0.0f;
-    if (acc > 1e6f) acc = 1e6f;
-    if (acc < -1e6f) acc = -1e6f;
-    out[out_idx] = acc;
+    if (out_idx >= 0 && out_idx < out_total) {
+        out[out_idx] = value;
+    }
 }
 
 __kernel void conv2d_backward_weight_nchw(
@@ -406,8 +426,12 @@ __kernel void sgd_update(
     float g = grad[gid];
     if (!isfinite(p)) p = 0.0f;
     if (!isfinite(g)) g = 0.0f;
+    // Clip gradient to prevent explosion
+    const float grad_clip = 10.0f;
+    if (g > grad_clip) g = grad_clip;
+    if (g < -grad_clip) g = -grad_clip;
     p -= lr * g;
-    if (!isfinite(p)) p = 0.0f;
+    // Also clip parameters to prevent extreme values
     if (p > 1e6f) p = 1e6f;
     if (p < -1e6f) p = -1e6f;
     param[gid] = p;
@@ -430,6 +454,10 @@ class GPUTrainConfig:
     stride: int = 1
     padding: int = 0
     shuffle: bool = True
+    debug_mode: bool = False
+    debug_batch_size: int = 8
+    debug_rtol: float = 1e-4
+    debug_atol: float = 1e-5
 
 
 class GPUTrainingPipeline:
@@ -478,33 +506,40 @@ class GPUTrainingPipeline:
 
     def _init_parameters(self) -> None:
         cfg = self.cfg
-        he_conv = np.sqrt(2.0 / (cfg.input_channels * cfg.kernel_size * cfg.kernel_size))
-        he_fc1 = np.sqrt(2.0 / self.flat_features)
-        he_fc2 = np.sqrt(2.0 / cfg.hidden_units)
+        he_conv = np.float32(np.sqrt(np.float32(2.0) / np.float32(cfg.input_channels * cfg.kernel_size * cfg.kernel_size)))
+        he_fc1 = np.float32(np.sqrt(np.float32(2.0) / np.float32(self.flat_features)))
+        he_fc2 = np.float32(np.sqrt(np.float32(2.0) / np.float32(cfg.hidden_units)))
 
-        w_conv = (
+        # Create CPU arrays and KEEP REFERENCES to them
+        self._cpu_w_conv = (
             np.random.randn(cfg.conv_filters, cfg.input_channels, cfg.kernel_size, cfg.kernel_size).astype(np.float32)
             * he_conv
-        )
-        b_conv = np.zeros((cfg.conv_filters,), dtype=np.float32)
-        w_fc1 = (np.random.randn(self.flat_features, cfg.hidden_units).astype(np.float32) * he_fc1)
-        b_fc1 = np.zeros((cfg.hidden_units,), dtype=np.float32)
-        w_fc2 = (np.random.randn(cfg.hidden_units, cfg.num_classes).astype(np.float32) * he_fc2)
-        b_fc2 = np.zeros((cfg.num_classes,), dtype=np.float32)
+        ).astype(np.float32, copy=False)
+        self._cpu_b_conv = np.zeros((cfg.conv_filters,), dtype=np.float32)
+        self._cpu_w_fc1 = (
+            np.random.randn(self.flat_features, cfg.hidden_units).astype(np.float32) * he_fc1
+        ).astype(np.float32, copy=False)
+        self._cpu_b_fc1 = np.zeros((cfg.hidden_units,), dtype=np.float32)
+        self._cpu_w_fc2 = (
+            np.random.randn(cfg.hidden_units, cfg.num_classes).astype(np.float32) * he_fc2
+        ).astype(np.float32, copy=False)
+        self._cpu_b_fc2 = np.zeros((cfg.num_classes,), dtype=np.float32)
 
-        self.w_conv = self.manager.to_device(w_conv)
-        self.b_conv = self.manager.to_device(b_conv)
-        self.w_fc1 = self.manager.to_device(w_fc1)
-        self.b_fc1 = self.manager.to_device(b_fc1)
-        self.w_fc2 = self.manager.to_device(w_fc2)
-        self.b_fc2 = self.manager.to_device(b_fc2)
+        # Use the safer to_device method for all uploads
+        self.w_conv = self.manager.to_device(self._cpu_w_conv)
+        self.b_conv = self.manager.to_device(self._cpu_b_conv)
+        self.w_fc1 = self.manager.to_device(self._cpu_w_fc1)
+        self.b_fc1 = self.manager.to_device(self._cpu_b_fc1)
+        self.w_fc2 = self.manager.to_device(self._cpu_w_fc2)
+        self.b_fc2 = self.manager.to_device(self._cpu_b_fc2)
 
-        self.gw_conv = self.manager.empty_device(w_conv.shape, np.dtype(np.float32))
-        self.gb_conv = self.manager.empty_device(b_conv.shape, np.dtype(np.float32))
-        self.gw_fc1 = self.manager.empty_device(w_fc1.shape, np.dtype(np.float32))
-        self.gb_fc1 = self.manager.empty_device(b_fc1.shape, np.dtype(np.float32))
-        self.gw_fc2 = self.manager.empty_device(w_fc2.shape, np.dtype(np.float32))
-        self.gb_fc2 = self.manager.empty_device(b_fc2.shape, np.dtype(np.float32))
+        # Allocate gradient buffers AFTER all params are uploaded
+        self.gw_conv = self.manager.empty_device(self._cpu_w_conv.shape, np.dtype(np.float32))
+        self.gb_conv = self.manager.empty_device(self._cpu_b_conv.shape, np.dtype(np.float32))
+        self.gw_fc1 = self.manager.empty_device(self._cpu_w_fc1.shape, np.dtype(np.float32))
+        self.gb_fc1 = self.manager.empty_device(self._cpu_b_fc1.shape, np.dtype(np.float32))
+        self.gw_fc2 = self.manager.empty_device(self._cpu_w_fc2.shape, np.dtype(np.float32))
+        self.gb_fc2 = self.manager.empty_device(self._cpu_b_fc2.shape, np.dtype(np.float32))
 
     def _alloc_batch_buffers(self, batch_size: int) -> dict[str, Any]:
         cfg = self.cfg
@@ -566,6 +601,216 @@ class GPUTrainingPipeline:
             f"min={float(np.nanmin(arr)):.6f} max={float(np.nanmax(arr)):.6f} "
             f"mean={float(np.nanmean(arr)):.6f} std={float(np.nanstd(arr)):.6f}"
         )
+
+    @staticmethod
+    def _stable_softmax(logits: np.ndarray) -> np.ndarray:
+        z = logits.astype(np.float32, copy=False)
+        shifted = z - np.max(z, axis=1, keepdims=True)
+        exp_shifted = np.exp(shifted)
+        denom = np.sum(exp_shifted, axis=1, keepdims=True)
+        denom = np.maximum(denom, np.float32(1e-12))
+        return exp_shifted / denom
+
+    @staticmethod
+    def _tensor_stats(arr: np.ndarray) -> dict[str, float | list[float]]:
+        flat = arr.reshape(-1).astype(np.float64, copy=False)
+        first = flat[:5]
+        return {
+            "min": float(np.min(flat)),
+            "max": float(np.max(flat)),
+            "mean": float(np.mean(flat)),
+            "std": float(np.std(flat)),
+            "first5": [float(v) for v in first],
+        }
+
+    @staticmethod
+    def _format_stats(stats: dict[str, float | list[float]]) -> str:
+        first5 = stats["first5"]
+        assert isinstance(first5, list)
+        first5_str = ", ".join(f"{float(v):.6g}" for v in first5)
+        return (
+            f"min={float(stats['min']):.6g} "
+            f"max={float(stats['max']):.6g} "
+            f"mean={float(stats['mean']):.6g} "
+            f"std={float(stats['std']):.6g} "
+            f"first5=[{first5_str}]"
+        )
+
+    @staticmethod
+    def _exp_overflow_flags(logits: np.ndarray) -> tuple[bool, bool, float]:
+        z = logits.astype(np.float32, copy=False)
+        max_logit = float(np.max(z))
+        overflow_threshold = float(np.log(np.finfo(np.float32).max))
+        would_overflow = bool(np.any(z > overflow_threshold))
+        with np.errstate(over="ignore", invalid="ignore"):
+            naive_exp = np.exp(z)
+        has_inf = bool(np.isinf(naive_exp).any())
+        return would_overflow, has_inf, max_logit
+
+    def _cpu_forward_intermediates(self, x: np.ndarray) -> dict[str, np.ndarray]:
+        cpu_model = self.to_cpu_model()
+        conv = cpu_model.layers[0]
+        relu1 = cpu_model.layers[1]
+        flatten = cpu_model.layers[2]
+        fc1 = cpu_model.layers[3]
+        relu2 = cpu_model.layers[4]
+        fc2 = cpu_model.layers[5]
+
+        z_conv = conv.forward(x, training=False)
+        a_conv = relu1.forward(z_conv, training=False)
+        flat = flatten.forward(a_conv, training=False)
+        z_fc1 = fc1.forward(flat, training=False)
+        a_fc1 = relu2.forward(z_fc1, training=False)
+        logits = fc2.forward(a_fc1, training=False)
+        probs = self._stable_softmax(logits)
+        return {
+            "z_conv": z_conv.astype(np.float32, copy=False),
+            "a_conv": a_conv.astype(np.float32, copy=False),
+            "z_fc1": z_fc1.astype(np.float32, copy=False),
+            "a_fc1": a_fc1.astype(np.float32, copy=False),
+            "logits": logits.astype(np.float32, copy=False),
+            "softmax": probs.astype(np.float32, copy=False),
+        }
+
+    def debug_compare_forward_pass(self, x_batch: np.ndarray) -> dict[str, Any]:
+        """
+        Run one identical forward pass on CPU and GPU and compare layer outputs.
+        Prints layer stats and returns a structured divergence report.
+        """
+        n_cur = min(int(self.cfg.debug_batch_size), int(self.cfg.batch_size), int(x_batch.shape[0]))
+        if n_cur <= 0:
+            raise ValueError("debug_compare_forward_pass requires a non-empty batch.")
+
+        x = np.ascontiguousarray(x_batch[:n_cur].astype(np.float32, copy=False))
+        sample_elems = self.cfg.input_channels * self.cfg.input_height * self.cfg.input_width
+        buffers = self._alloc_batch_buffers(self.cfg.batch_size)
+
+        # Seed output buffers with NaN to catch partially-written outputs.
+        nan_fill = {
+            "z_conv": np.full((self.cfg.batch_size, self.cfg.conv_filters, self.oh, self.ow), np.nan, dtype=np.float32),
+            "a_conv": np.full((self.cfg.batch_size, self.cfg.conv_filters, self.oh, self.ow), np.nan, dtype=np.float32),
+            "z_fc1": np.full((self.cfg.batch_size, self.cfg.hidden_units), np.nan, dtype=np.float32),
+            "a_fc1": np.full((self.cfg.batch_size, self.cfg.hidden_units), np.nan, dtype=np.float32),
+            "logits": np.full((self.cfg.batch_size, self.cfg.num_classes), np.nan, dtype=np.float32),
+        }
+        cl.enqueue_copy(self.manager.queue, buffers["z_conv"], nan_fill["z_conv"])
+        cl.enqueue_copy(self.manager.queue, buffers["a_conv"], nan_fill["a_conv"])
+        cl.enqueue_copy(self.manager.queue, buffers["z_fc1"], nan_fill["z_fc1"])
+        cl.enqueue_copy(self.manager.queue, buffers["a_fc1"], nan_fill["a_fc1"])
+        cl.enqueue_copy(self.manager.queue, buffers["logits"], nan_fill["logits"])
+        self.manager.queue.finish()
+
+        x_dev = self.manager.to_device(x)
+        self._forward_only(x_dev=x_dev, n_cur=n_cur, sample_elems=sample_elems, buffers=buffers)
+
+        gpu_intermediates = {
+            "z_conv": self.manager.from_device(
+                buffers["z_conv"], (n_cur, self.cfg.conv_filters, self.oh, self.ow), np.dtype(np.float32)
+            ),
+            "a_conv": self.manager.from_device(
+                buffers["a_conv"], (n_cur, self.cfg.conv_filters, self.oh, self.ow), np.dtype(np.float32)
+            ),
+            "z_fc1": self.manager.from_device(buffers["z_fc1"], (n_cur, self.cfg.hidden_units), np.dtype(np.float32)),
+            "a_fc1": self.manager.from_device(buffers["a_fc1"], (n_cur, self.cfg.hidden_units), np.dtype(np.float32)),
+            "logits": self.manager.from_device(buffers["logits"], (n_cur, self.cfg.num_classes), np.dtype(np.float32)),
+        }
+        gpu_intermediates["softmax"] = self._stable_softmax(gpu_intermediates["logits"])
+
+        cpu_intermediates = self._cpu_forward_intermediates(x)
+
+        print("\n[DEBUG] CPU vs GPU forward-pass diagnostics")
+        print(
+            f"[DEBUG] batch={n_cur} rtol={self.cfg.debug_rtol:.2e} atol={self.cfg.debug_atol:.2e} "
+            f"input_dtype={x.dtype}"
+        )
+
+        params = self._parameter_snapshot()
+        gpu_param_dtypes = sorted({str(v.dtype) for v in params.values()})
+        cpu_param_dtypes = sorted({str(p.dtype) for p in self.to_cpu_model().parameters()})
+        has_float64 = any(dt == "float64" for dt in gpu_param_dtypes + cpu_param_dtypes + [str(x.dtype)])
+        print(f"[DEBUG] dtype check: input={x.dtype} cpu_params={cpu_param_dtypes} gpu_params={gpu_param_dtypes}")
+        print(f"[DEBUG] float64 mismatch detected: {'YES' if has_float64 else 'NO'}")
+
+        buffer_write_issues: list[str] = []
+        for name in ("z_conv", "a_conv", "z_fc1", "a_fc1", "logits"):
+            if not np.isfinite(gpu_intermediates[name]).all():
+                buffer_write_issues.append(name)
+        if buffer_write_issues:
+            print(f"[DEBUG] buffer initialization/write issue suspected in: {', '.join(buffer_write_issues)}")
+        else:
+            print("[DEBUG] buffer initialization/write issue suspected: NO")
+
+        kernel_softmax_stable = "sum_exp += exp(v - max_v)" in KERNEL_SOURCE
+        print(f"[DEBUG] softmax stabilization pattern in GPU kernel: {'YES' if kernel_softmax_stable else 'NO'}")
+
+        cpu_overflow = self._exp_overflow_flags(cpu_intermediates["logits"])
+        gpu_overflow = self._exp_overflow_flags(gpu_intermediates["logits"])
+        print(
+            "[DEBUG] exp overflow check (logits): "
+            f"CPU would_overflow={cpu_overflow[0]} naive_exp_inf={cpu_overflow[1]} max_logit={cpu_overflow[2]:.6g}; "
+            f"GPU would_overflow={gpu_overflow[0]} naive_exp_inf={gpu_overflow[1]} max_logit={gpu_overflow[2]:.6g}"
+        )
+
+        layer_order = [
+            ("Conv output", "z_conv"),
+            ("After ReLU (conv)", "a_conv"),
+            ("Dense output (fc1)", "z_fc1"),
+            ("After ReLU (fc1)", "a_fc1"),
+            ("Dense output (logits)", "logits"),
+            ("Softmax output", "softmax"),
+        ]
+
+        first_divergence: str | None = None
+        layer_report: list[dict[str, Any]] = []
+        for title, key in layer_order:
+            cpu_arr = cpu_intermediates[key]
+            gpu_arr = gpu_intermediates[key]
+            diff = np.abs(cpu_arr - gpu_arr)
+            allclose = bool(np.allclose(cpu_arr, gpu_arr, rtol=self.cfg.debug_rtol, atol=self.cfg.debug_atol))
+            if first_divergence is None and not allclose:
+                first_divergence = title
+
+            cpu_stats = self._tensor_stats(cpu_arr)
+            gpu_stats = self._tensor_stats(gpu_arr)
+            diff_stats = self._tensor_stats(diff)
+            print(f"[DEBUG] {title}")
+            print(f"        CPU: {self._format_stats(cpu_stats)}")
+            print(f"        GPU: {self._format_stats(gpu_stats)}")
+            print(f"        |CPU-GPU|: {self._format_stats(diff_stats)} allclose={allclose}")
+            layer_report.append(
+                {
+                    "layer": title,
+                    "allclose": allclose,
+                    "cpu": cpu_stats,
+                    "gpu": gpu_stats,
+                    "abs_diff": diff_stats,
+                }
+            )
+
+        if first_divergence is None:
+            print("[DEBUG] First divergence layer: none (within tolerance).")
+        else:
+            print(f"[DEBUG] First divergence layer: {first_divergence}")
+
+        return {
+            "first_divergence_layer": first_divergence,
+            "float64_mismatch": has_float64,
+            "buffer_write_issues": buffer_write_issues,
+            "softmax_stabilization_present": kernel_softmax_stable,
+            "exp_overflow": {
+                "cpu": {
+                    "would_overflow": cpu_overflow[0],
+                    "naive_exp_has_inf": cpu_overflow[1],
+                    "max_logit": cpu_overflow[2],
+                },
+                "gpu": {
+                    "would_overflow": gpu_overflow[0],
+                    "naive_exp_has_inf": gpu_overflow[1],
+                    "max_logit": gpu_overflow[2],
+                },
+            },
+            "layers": layer_report,
+        }
 
     def _forward_only(self, x_dev: Any, n_cur: int, sample_elems: int, buffers: dict[str, Any]) -> None:
         cfg = self.cfg
@@ -729,6 +974,9 @@ class GPUTrainingPipeline:
             y_train = y_train.astype(np.int32, copy=False)
         if y_test.dtype != np.int32:
             y_test = y_test.astype(np.int32, copy=False)
+
+        if cfg.debug_mode:
+            _ = self.debug_compare_forward_pass(x_train)
 
         x_test_dev = self.manager.to_device(np.ascontiguousarray(x_test))
         y_test_dev = self.manager.to_device(np.ascontiguousarray(y_test))

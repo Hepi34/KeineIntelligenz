@@ -143,6 +143,55 @@ PRESETS: dict[str, Preset] = {
         train_limit=60000,
         test_limit=10000,
     ),
+    # v3 (higher-capacity presets)
+    "v3/Mini": Preset(
+        key="v3/Mini",
+        version="v3",
+        name="Mini",
+        epochs=3,
+        batch_size=64,
+        lr=0.01,
+        conv_filters=16,
+        hidden_units=96,
+        train_limit=6000,
+        test_limit=2000,
+    ),
+    "v3/Normal": Preset(
+        key="v3/Normal",
+        version="v3",
+        name="Normal",
+        epochs=6,
+        batch_size=64,
+        lr=0.007,
+        conv_filters=24,
+        hidden_units=160,
+        train_limit=25000,
+        test_limit=5000,
+    ),
+    "v3/Pro": Preset(
+        key="v3/Pro",
+        version="v3",
+        name="Pro",
+        epochs=10,
+        batch_size=64,
+        lr=0.0045,
+        conv_filters=32,
+        hidden_units=256,
+        train_limit=60000,
+        test_limit=10000,
+    ),
+    "v3/Extreme": Preset(
+        key="v3/Extreme",
+        version="v3",
+        name="Extreme",
+        epochs=14,
+        batch_size=64,
+        lr=0.0035,
+        conv_filters=48,
+        hidden_units=384,
+        train_limit=60000,
+        test_limit=10000,
+    ),
 }
 
 
@@ -262,6 +311,8 @@ class GPUTrainingWorker(QObject):
                     learning_rate=min(0.01, self.preset.lr),
                     conv_filters=self.preset.conv_filters,
                     hidden_units=self.preset.hidden_units,
+                    debug_mode=os.getenv("CNN_DEBUG_MODE", "0").strip().lower() in {"1", "true", "yes", "on"},
+                    debug_batch_size=max(1, int(os.getenv("CNN_DEBUG_BATCH_SIZE", "8"))),
                 ),
             )
             pipeline.sanity_check(x_train[: self.preset.batch_size], y_train[: self.preset.batch_size])
@@ -456,6 +507,8 @@ class MainWindow(QMainWindow):
         self._active_total_epochs: int = 1
         self.current_model: CNNModel | None = None
         self.current_model_path: Path | None = None
+        self._active_preset_key: str | None = None
+        self._active_device_key: str = "CPU"
         self._test_cache: tuple[np.ndarray, np.ndarray] | None = None
         self._test_cache_paths: MNISTFilePaths | None = None
         self._drawing_window: DrawingWindow | None = None
@@ -577,6 +630,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Select Preset", "Please select a concrete preset, not a version header.")
             return
         self._active_total_epochs = preset.epochs
+        self._active_preset_key = preset.key
+        self._active_device_key = "GPU" if self.device_combo.currentIndex() == 1 else "CPU"
         num_threads = int(self.thread_spin.value())
         paths = self._selected_paths()
         missing = [
@@ -635,7 +690,14 @@ class MainWindow(QMainWindow):
         self._draw_history(history)
         if isinstance(model, CNNModel):
             self.current_model = model
-            default_save_path = Path(__file__).resolve().parent / "last_model.npz"
+            preset = PRESETS.get(self._active_preset_key or "")
+            version = preset.version if preset is not None else "vX"
+            model_name = (preset.name if preset is not None else "Model").lower()
+            device_name = self._active_device_key
+            file_name = f"{version}{model_name}{device_name}.npz"
+            default_save_dir = Path(__file__).resolve().parent.parent / "models"
+            default_save_dir.mkdir(parents=True, exist_ok=True)
+            default_save_path = default_save_dir / file_name
             try:
                 self.current_model.save_weights(default_save_path)
                 self.current_model_path = default_save_path
@@ -845,12 +907,17 @@ class MainWindow(QMainWindow):
         self.preset_combo.addItem("v2/Mini")
         self.preset_combo.addItem("v2/Normal")
         self.preset_combo.addItem("v2/Pro")
+        self.preset_combo.addItem("v3")
+        self.preset_combo.addItem("v3/Mini")
+        self.preset_combo.addItem("v3/Normal")
+        self.preset_combo.addItem("v3/Pro")
+        self.preset_combo.addItem("v3/Extreme")
 
-        for idx in (0, 4):
+        for idx in (0, 4, 8):
             item = self.preset_combo.model().item(idx)
             if item is not None:
                 item.setEnabled(False)
-        self.preset_combo.setCurrentText("v2/Normal")
+        self.preset_combo.setCurrentText("v3/Normal")
 
     def _current_preset(self) -> Preset | None:
         key = self.preset_combo.currentText()
@@ -873,6 +940,8 @@ class MainWindow(QMainWindow):
             f"Epochs: {preset.epochs} | Batch: {preset.batch_size} | LR: {preset.lr}",
             f"Train limit: {preset.train_limit} | Test limit: {preset.test_limit}",
         ]
+        if preset.key == "v3/Extreme":
+            lines.append("Note: highest-capacity preset; intended to push toward >=99% test accuracy.")
         self.preset_details_label.setText("\n".join(lines))
 
 
