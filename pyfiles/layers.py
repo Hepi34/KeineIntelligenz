@@ -235,6 +235,74 @@ class ReLU(Layer):
         return grad_output * self._mask
 
 
+class MaxPool2D(Layer):
+    """2D max pooling for NCHW tensors."""
+
+    def __init__(self, kernel_size: int = 2, stride: int = 2) -> None:
+        if kernel_size <= 0:
+            raise ValueError(f"kernel_size must be > 0, got {kernel_size}.")
+        if stride <= 0:
+            raise ValueError(f"stride must be > 0, got {stride}.")
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self._x_shape: tuple[int, ...] | None = None
+        self._argmax: np.ndarray | None = None
+
+    def forward(self, x: np.ndarray, training: bool = True) -> np.ndarray:
+        if x.ndim != 4:
+            raise ValueError(f"MaxPool2D expects input shape (N, C, H, W), got {x.shape}.")
+        x = x.astype(np.float32, copy=False)
+        n, c, h, w = x.shape
+        k = self.kernel_size
+        s = self.stride
+
+        out_h = (h - k) // s + 1
+        out_w = (w - k) // s + 1
+        if out_h <= 0 or out_w <= 0:
+            raise ValueError(f"Invalid MaxPool2D output shape from input {x.shape} with k={k}, s={s}.")
+
+        out = np.empty((n, c, out_h, out_w), dtype=np.float32)
+        argmax = np.empty((n, c, out_h, out_w), dtype=np.int32)
+
+        for oh in range(out_h):
+            hs = oh * s
+            he = hs + k
+            for ow in range(out_w):
+                ws = ow * s
+                we = ws + k
+                window = x[:, :, hs:he, ws:we]  # (N, C, k, k)
+                flat = window.reshape(n, c, -1)
+                idx = np.argmax(flat, axis=2).astype(np.int32)
+                out[:, :, oh, ow] = np.take_along_axis(flat, idx[:, :, None], axis=2).squeeze(axis=2)
+                argmax[:, :, oh, ow] = idx
+
+        self._x_shape = x.shape
+        self._argmax = argmax
+        return out
+
+    def backward(self, grad_output: np.ndarray) -> np.ndarray:
+        if self._x_shape is None or self._argmax is None:
+            raise RuntimeError("Call forward before backward.")
+        grad_output = grad_output.astype(np.float32, copy=False)
+        n, c, h, w = self._x_shape
+        out_h, out_w = grad_output.shape[2], grad_output.shape[3]
+        k = self.kernel_size
+        s = self.stride
+
+        grad_input = np.zeros((n, c, h, w), dtype=np.float32)
+        for oh in range(out_h):
+            hs = oh * s
+            for ow in range(out_w):
+                ws = ow * s
+                idx = self._argmax[:, :, oh, ow]
+                idx_h = idx // k
+                idx_w = idx % k
+                n_idx = np.arange(n)[:, None]
+                c_idx = np.arange(c)[None, :]
+                grad_input[n_idx, c_idx, hs + idx_h, ws + idx_w] += grad_output[:, :, oh, ow]
+        return grad_input
+
+
 class Softmax(Layer):
     """Softmax activation over class dimension."""
 

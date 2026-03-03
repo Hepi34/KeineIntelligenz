@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from layers import Conv2D, Dense, Flatten, ReLU
+from layers import Conv2D, Dense, Flatten, MaxPool2D, ReLU
 from model import CNNModel
 from opencl_backend import OpenCLManager, cl
 
@@ -238,6 +238,81 @@ __kernel void relu_backward(
     grad_x[gid] = x[gid] > 0.0f ? grad_out[gid] : 0.0f;
 }
 
+__kernel void maxpool2x2_forward_nchw(
+    __global const float* x,
+    __global float* out,
+    __global int* argmax_idx,
+    const int N,
+    const int C,
+    const int H,
+    const int W,
+    const int OH,
+    const int OW
+) {
+    const int n = get_global_id(0);
+    const int c = get_global_id(1);
+    const int flat = get_global_id(2);
+    if (n >= N || c >= C || flat >= OH * OW) return;
+
+    const int oh = flat / OW;
+    const int ow = flat % OW;
+    const int ih0 = oh * 2;
+    const int iw0 = ow * 2;
+
+    const int base = ((n * C + c) * H);
+    float best = -INFINITY;
+    int best_idx = 0;
+    for (int kh = 0; kh < 2; ++kh) {
+        for (int kw = 0; kw < 2; ++kw) {
+            const int ih = ih0 + kh;
+            const int iw = iw0 + kw;
+            if (ih < H && iw < W) {
+                const int idx = (base + ih) * W + iw;
+                const float v = x[idx];
+                if (v > best) {
+                    best = v;
+                    best_idx = ih * W + iw;
+                }
+            }
+        }
+    }
+    const int out_idx = ((n * C + c) * OH + oh) * OW + ow;
+    out[out_idx] = best;
+    argmax_idx[out_idx] = best_idx;
+}
+
+__kernel void maxpool2x2_backward_nchw(
+    __global const float* grad_out,
+    __global const int* argmax_idx,
+    __global float* grad_in,
+    const int N,
+    const int C,
+    const int H,
+    const int W,
+    const int OH,
+    const int OW
+) {
+    const int n = get_global_id(0);
+    const int c = get_global_id(1);
+    const int hw = get_global_id(2);
+    if (n >= N || c >= C || hw >= H * W) return;
+
+    const int ih = hw / W;
+    const int iw = hw % W;
+    const int oh = ih / 2;
+    const int ow = iw / 2;
+    float g = 0.0f;
+    if (oh < OH && ow < OW) {
+        const int out_idx = ((n * C + c) * OH + oh) * OW + ow;
+        const int idx = argmax_idx[out_idx];
+        if (idx == ih * W + iw) {
+            g = grad_out[out_idx];
+        }
+    }
+    const int in_idx = ((n * C + c) * H + ih) * W + iw;
+    grad_in[in_idx] = g;
+}
+
 __kernel void dense_forward(
     __global const float* x,
     __global const float* w,
@@ -436,6 +511,46 @@ __kernel void sgd_update(
     if (p < -1e6f) p = -1e6f;
     param[gid] = p;
 }
+
+__kernel void adam_update(
+    __global float* param,
+    __global const float* grad,
+    __global float* m,
+    __global float* v,
+    const float lr,
+    const float beta1,
+    const float beta2,
+    const float eps,
+    const int t,
+    const int n
+) {
+    const int gid = get_global_id(0);
+    if (gid >= n) return;
+
+    float p = param[gid];
+    float g = grad[gid];
+    float m_t = m[gid];
+    float v_t = v[gid];
+    if (!isfinite(p)) p = 0.0f;
+    if (!isfinite(g)) g = 0.0f;
+    if (g > 10.0f) g = 10.0f;
+    if (g < -10.0f) g = -10.0f;
+
+    m_t = beta1 * m_t + (1.0f - beta1) * g;
+    v_t = beta2 * v_t + (1.0f - beta2) * g * g;
+    m[gid] = m_t;
+    v[gid] = v_t;
+
+    const float one_minus_b1t = 1.0f - pow(beta1, (float)t);
+    const float one_minus_b2t = 1.0f - pow(beta2, (float)t);
+    const float m_hat = m_t / fmax(one_minus_b1t, 1e-12f);
+    const float v_hat = v_t / fmax(one_minus_b2t, 1e-12f);
+    p -= lr * m_hat / (sqrt(fmax(v_hat, 1e-30f)) + eps);
+
+    if (p > 1e6f) p = 1e6f;
+    if (p < -1e6f) p = -1e6f;
+    param[gid] = p;
+}
 """
 
 
@@ -445,6 +560,7 @@ class GPUTrainConfig:
     batch_size: int = 64
     learning_rate: float = 0.01
     conv_filters: int = 8
+    conv2_filters: int = 0
     hidden_units: int = 64
     num_classes: int = 10
     input_channels: int = 1
@@ -454,6 +570,12 @@ class GPUTrainConfig:
     stride: int = 1
     padding: int = 0
     shuffle: bool = True
+    use_second_conv: bool = False
+    use_maxpool: bool = False
+    optimizer: str = "sgd"
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_eps: float = 1e-8
     debug_mode: bool = False
     debug_batch_size: int = 8
     debug_rtol: float = 1e-4
@@ -471,12 +593,37 @@ class GPUTrainingPipeline:
         self.program = cl.Program(self.manager.context, KERNEL_SOURCE).build()
         self._init_kernels()
 
-        self.oh = (config.input_height + 2 * config.padding - config.kernel_size) // config.stride + 1
-        self.ow = (config.input_width + 2 * config.padding - config.kernel_size) // config.stride + 1
-        if self.oh <= 0 or self.ow <= 0:
+        self.use_second_conv = bool(config.use_second_conv)
+        self.use_maxpool = bool(config.use_maxpool)
+        self.conv2_filters = int(config.conv2_filters if config.conv2_filters > 0 else config.conv_filters)
+
+        self.c1_oh = (config.input_height + 2 * config.padding - config.kernel_size) // config.stride + 1
+        self.c1_ow = (config.input_width + 2 * config.padding - config.kernel_size) // config.stride + 1
+        if self.c1_oh <= 0 or self.c1_ow <= 0:
             raise ValueError("Invalid conv output shape; check kernel/stride/padding.")
 
-        self.flat_features = config.conv_filters * self.oh * self.ow
+        if self.use_second_conv:
+            self.c2_oh = (self.c1_oh + 2 * config.padding - config.kernel_size) // config.stride + 1
+            self.c2_ow = (self.c1_ow + 2 * config.padding - config.kernel_size) // config.stride + 1
+            if self.c2_oh <= 0 or self.c2_ow <= 0:
+                raise ValueError("Invalid second conv output shape; check kernel/stride/padding.")
+            self.post_h = self.c2_oh // 2 if self.use_maxpool else self.c2_oh
+            self.post_w = self.c2_ow // 2 if self.use_maxpool else self.c2_ow
+            self.post_c = self.conv2_filters
+        else:
+            self.c2_oh = self.c1_oh
+            self.c2_ow = self.c1_ow
+            self.post_h = self.c1_oh
+            self.post_w = self.c1_ow
+            self.post_c = config.conv_filters
+
+        if self.post_h <= 0 or self.post_w <= 0:
+            raise ValueError("Invalid post-activation feature map shape.")
+
+        self.oh = self.c1_oh
+        self.ow = self.c1_ow
+        self.flat_features = self.post_c * self.post_h * self.post_w
+        self._adam_step_count = 0
         self._init_parameters()
 
     def _init_kernels(self) -> None:
@@ -492,6 +639,8 @@ class GPUTrainingPipeline:
         self.k_conv2d_backward_input_nchw = cl.Kernel(self.program, "conv2d_backward_input_nchw")
         self.k_relu_forward = cl.Kernel(self.program, "relu_forward")
         self.k_relu_backward = cl.Kernel(self.program, "relu_backward")
+        self.k_maxpool2x2_forward_nchw = cl.Kernel(self.program, "maxpool2x2_forward_nchw")
+        self.k_maxpool2x2_backward_nchw = cl.Kernel(self.program, "maxpool2x2_backward_nchw")
         self.k_dense_forward = cl.Kernel(self.program, "dense_forward")
         self.k_dense_backward_input = cl.Kernel(self.program, "dense_backward_input")
         self.k_dense_backward_weight = cl.Kernel(self.program, "dense_backward_weight")
@@ -503,10 +652,12 @@ class GPUTrainingPipeline:
         self.k_div_f32_by_i32 = cl.Kernel(self.program, "div_f32_by_i32")
         self.k_accuracy_flag_from_logits = cl.Kernel(self.program, "accuracy_flag_from_logits")
         self.k_sgd_update = cl.Kernel(self.program, "sgd_update")
+        self.k_adam_update = cl.Kernel(self.program, "adam_update")
 
     def _init_parameters(self) -> None:
         cfg = self.cfg
         he_conv = np.float32(np.sqrt(np.float32(2.0) / np.float32(cfg.input_channels * cfg.kernel_size * cfg.kernel_size)))
+        he_conv2 = np.float32(np.sqrt(np.float32(2.0) / np.float32(cfg.conv_filters * cfg.kernel_size * cfg.kernel_size)))
         he_fc1 = np.float32(np.sqrt(np.float32(2.0) / np.float32(self.flat_features)))
         he_fc2 = np.float32(np.sqrt(np.float32(2.0) / np.float32(cfg.hidden_units)))
 
@@ -516,6 +667,11 @@ class GPUTrainingPipeline:
             * he_conv
         ).astype(np.float32, copy=False)
         self._cpu_b_conv = np.zeros((cfg.conv_filters,), dtype=np.float32)
+        self._cpu_w_conv2 = (
+            np.random.randn(self.conv2_filters, cfg.conv_filters, cfg.kernel_size, cfg.kernel_size).astype(np.float32)
+            * he_conv2
+        ).astype(np.float32, copy=False)
+        self._cpu_b_conv2 = np.zeros((self.conv2_filters,), dtype=np.float32)
         self._cpu_w_fc1 = (
             np.random.randn(self.flat_features, cfg.hidden_units).astype(np.float32) * he_fc1
         ).astype(np.float32, copy=False)
@@ -528,6 +684,8 @@ class GPUTrainingPipeline:
         # Use the safer to_device method for all uploads
         self.w_conv = self.manager.to_device(self._cpu_w_conv)
         self.b_conv = self.manager.to_device(self._cpu_b_conv)
+        self.w_conv2 = self.manager.to_device(self._cpu_w_conv2)
+        self.b_conv2 = self.manager.to_device(self._cpu_b_conv2)
         self.w_fc1 = self.manager.to_device(self._cpu_w_fc1)
         self.b_fc1 = self.manager.to_device(self._cpu_b_fc1)
         self.w_fc2 = self.manager.to_device(self._cpu_w_fc2)
@@ -536,20 +694,49 @@ class GPUTrainingPipeline:
         # Allocate gradient buffers AFTER all params are uploaded
         self.gw_conv = self.manager.empty_device(self._cpu_w_conv.shape, np.dtype(np.float32))
         self.gb_conv = self.manager.empty_device(self._cpu_b_conv.shape, np.dtype(np.float32))
+        self.gw_conv2 = self.manager.empty_device(self._cpu_w_conv2.shape, np.dtype(np.float32))
+        self.gb_conv2 = self.manager.empty_device(self._cpu_b_conv2.shape, np.dtype(np.float32))
         self.gw_fc1 = self.manager.empty_device(self._cpu_w_fc1.shape, np.dtype(np.float32))
         self.gb_fc1 = self.manager.empty_device(self._cpu_b_fc1.shape, np.dtype(np.float32))
         self.gw_fc2 = self.manager.empty_device(self._cpu_w_fc2.shape, np.dtype(np.float32))
         self.gb_fc2 = self.manager.empty_device(self._cpu_b_fc2.shape, np.dtype(np.float32))
 
+        self._adam_states: list[tuple[Any, Any, Any, Any, int]] = []
+        if self.cfg.optimizer.lower() == "adam":
+            params = [
+                (self.w_conv, self.gw_conv, self._cpu_w_conv.shape),
+                (self.b_conv, self.gb_conv, self._cpu_b_conv.shape),
+            ]
+            if self.use_second_conv:
+                params.extend(
+                    [
+                        (self.w_conv2, self.gw_conv2, self._cpu_w_conv2.shape),
+                        (self.b_conv2, self.gb_conv2, self._cpu_b_conv2.shape),
+                    ]
+                )
+            params.extend(
+                [
+                    (self.w_fc1, self.gw_fc1, self._cpu_w_fc1.shape),
+                    (self.b_fc1, self.gb_fc1, self._cpu_b_fc1.shape),
+                    (self.w_fc2, self.gw_fc2, self._cpu_w_fc2.shape),
+                    (self.b_fc2, self.gb_fc2, self._cpu_b_fc2.shape),
+                ]
+            )
+            for param, grad, shape in params:
+                m = self.manager.to_device(np.zeros(shape, dtype=np.float32))
+                v = self.manager.to_device(np.zeros(shape, dtype=np.float32))
+                n = int(np.prod(shape))
+                self._adam_states.append((param, grad, m, v, n))
+
     def _alloc_batch_buffers(self, batch_size: int) -> dict[str, Any]:
         cfg = self.cfg
-        return {
+        buffers: dict[str, Any] = {
             "x": self.manager.empty_device(
                 (batch_size, cfg.input_channels, cfg.input_height, cfg.input_width), np.dtype(np.float32)
             ),
             "y": self.manager.empty_device((batch_size,), np.dtype(np.int32)),
-            "z_conv": self.manager.empty_device((batch_size, cfg.conv_filters, self.oh, self.ow), np.dtype(np.float32)),
-            "a_conv": self.manager.empty_device((batch_size, cfg.conv_filters, self.oh, self.ow), np.dtype(np.float32)),
+            "z_conv": self.manager.empty_device((batch_size, cfg.conv_filters, self.c1_oh, self.c1_ow), np.dtype(np.float32)),
+            "a_conv": self.manager.empty_device((batch_size, cfg.conv_filters, self.c1_oh, self.c1_ow), np.dtype(np.float32)),
             "z_fc1": self.manager.empty_device((batch_size, cfg.hidden_units), np.dtype(np.float32)),
             "a_fc1": self.manager.empty_device((batch_size, cfg.hidden_units), np.dtype(np.float32)),
             "logits": self.manager.empty_device((batch_size, cfg.num_classes), np.dtype(np.float32)),
@@ -557,7 +744,7 @@ class GPUTrainingPipeline:
             "d_a_fc1": self.manager.empty_device((batch_size, cfg.hidden_units), np.dtype(np.float32)),
             "d_z_fc1": self.manager.empty_device((batch_size, cfg.hidden_units), np.dtype(np.float32)),
             "d_a_conv": self.manager.empty_device((batch_size, self.flat_features), np.dtype(np.float32)),
-            "d_z_conv": self.manager.empty_device((batch_size, cfg.conv_filters, self.oh, self.ow), np.dtype(np.float32)),
+            "d_z_conv": self.manager.empty_device((batch_size, cfg.conv_filters, self.c1_oh, self.c1_ow), np.dtype(np.float32)),
             "d_x": self.manager.empty_device(
                 (batch_size, cfg.input_channels, cfg.input_height, cfg.input_width), np.dtype(np.float32)
             ),
@@ -569,29 +756,72 @@ class GPUTrainingPipeline:
             "correct_sum": self.manager.empty_device((1,), np.dtype(np.float32)),
             "correct_accum": self.manager.empty_device((1,), np.dtype(np.float32)),
         }
+        if self.use_second_conv:
+            buffers["z_conv2"] = self.manager.empty_device(
+                (batch_size, self.conv2_filters, self.c2_oh, self.c2_ow), np.dtype(np.float32)
+            )
+            buffers["a_conv2"] = self.manager.empty_device(
+                (batch_size, self.conv2_filters, self.c2_oh, self.c2_ow), np.dtype(np.float32)
+            )
+            if self.use_maxpool:
+                buffers["pool"] = self.manager.empty_device(
+                    (batch_size, self.conv2_filters, self.post_h, self.post_w), np.dtype(np.float32)
+                )
+                buffers["pool_idx"] = self.manager.empty_device(
+                    (batch_size, self.conv2_filters, self.post_h, self.post_w), np.dtype(np.int32)
+                )
+                buffers["d_a_conv2"] = self.manager.empty_device(
+                    (batch_size, self.conv2_filters, self.c2_oh, self.c2_ow), np.dtype(np.float32)
+                )
+            else:
+                buffers["pool"] = buffers["a_conv2"]
+                buffers["d_a_conv2"] = self.manager.empty_device(
+                    (batch_size, self.conv2_filters, self.c2_oh, self.c2_ow), np.dtype(np.float32)
+                )
+            buffers["d_z_conv2"] = self.manager.empty_device(
+                (batch_size, self.conv2_filters, self.c2_oh, self.c2_ow), np.dtype(np.float32)
+            )
+            buffers["d_a_conv1"] = self.manager.empty_device(
+                (batch_size, cfg.conv_filters, self.c1_oh, self.c1_ow), np.dtype(np.float32)
+            )
+            buffers["d_z_conv1"] = self.manager.empty_device(
+                (batch_size, cfg.conv_filters, self.c1_oh, self.c1_ow), np.dtype(np.float32)
+            )
+            # keep compatibility names for existing diagnostics
+            buffers["z_conv1"] = buffers["z_conv"]
+            buffers["a_conv1"] = buffers["a_conv"]
+        return buffers
 
     def _parameter_snapshot(self) -> dict[str, np.ndarray]:
         cfg = self.cfg
-        return {
+        snap = {
             "w_conv": self.manager.from_device(
                 self.w_conv,
                 (cfg.conv_filters, cfg.input_channels, cfg.kernel_size, cfg.kernel_size),
                 np.dtype(np.float32),
             ),
             "b_conv": self.manager.from_device(self.b_conv, (cfg.conv_filters,), np.dtype(np.float32)),
-            "w_fc1": self.manager.from_device(
-                self.w_fc1,
-                (self.flat_features, cfg.hidden_units),
-                np.dtype(np.float32),
-            ),
-            "b_fc1": self.manager.from_device(self.b_fc1, (cfg.hidden_units,), np.dtype(np.float32)),
-            "w_fc2": self.manager.from_device(
-                self.w_fc2,
-                (cfg.hidden_units, cfg.num_classes),
-                np.dtype(np.float32),
-            ),
-            "b_fc2": self.manager.from_device(self.b_fc2, (cfg.num_classes,), np.dtype(np.float32)),
         }
+        if self.use_second_conv:
+            snap["w_conv2"] = self.manager.from_device(
+                self.w_conv2,
+                (self.conv2_filters, cfg.conv_filters, cfg.kernel_size, cfg.kernel_size),
+                np.dtype(np.float32),
+            )
+            snap["b_conv2"] = self.manager.from_device(self.b_conv2, (self.conv2_filters,), np.dtype(np.float32))
+        snap["w_fc1"] = self.manager.from_device(
+            self.w_fc1,
+            (self.flat_features, cfg.hidden_units),
+            np.dtype(np.float32),
+        )
+        snap["b_fc1"] = self.manager.from_device(self.b_fc1, (cfg.hidden_units,), np.dtype(np.float32))
+        snap["w_fc2"] = self.manager.from_device(
+            self.w_fc2,
+            (cfg.hidden_units, cfg.num_classes),
+            np.dtype(np.float32),
+        )
+        snap["b_fc2"] = self.manager.from_device(self.b_fc2, (cfg.num_classes,), np.dtype(np.float32))
+        return snap
 
     @staticmethod
     def _finite_stats(name: str, arr: np.ndarray) -> str:
@@ -649,13 +879,49 @@ class GPUTrainingPipeline:
 
     def _cpu_forward_intermediates(self, x: np.ndarray) -> dict[str, np.ndarray]:
         cpu_model = self.to_cpu_model()
+        if self.use_second_conv:
+            conv1 = cpu_model.layers[0]
+            relu1 = cpu_model.layers[1]
+            conv2 = cpu_model.layers[2]
+            relu2 = cpu_model.layers[3]
+            idx = 4
+            pool = None
+            if self.use_maxpool:
+                pool = cpu_model.layers[idx]
+                idx += 1
+            flatten = cpu_model.layers[idx]
+            fc1 = cpu_model.layers[idx + 1]
+            relu3 = cpu_model.layers[idx + 2]
+            fc2 = cpu_model.layers[idx + 3]
+
+            z_conv1 = conv1.forward(x, training=False)
+            a_conv1 = relu1.forward(z_conv1, training=False)
+            z_conv2 = conv2.forward(a_conv1, training=False)
+            a_conv2 = relu2.forward(z_conv2, training=False)
+            pooled = pool.forward(a_conv2, training=False) if pool is not None else a_conv2
+            flat = flatten.forward(pooled, training=False)
+            z_fc1 = fc1.forward(flat, training=False)
+            a_fc1 = relu3.forward(z_fc1, training=False)
+            logits = fc2.forward(a_fc1, training=False)
+            probs = self._stable_softmax(logits)
+            return {
+                "z_conv": z_conv1.astype(np.float32, copy=False),
+                "a_conv": a_conv1.astype(np.float32, copy=False),
+                "z_conv2": z_conv2.astype(np.float32, copy=False),
+                "a_conv2": a_conv2.astype(np.float32, copy=False),
+                "pool": pooled.astype(np.float32, copy=False),
+                "z_fc1": z_fc1.astype(np.float32, copy=False),
+                "a_fc1": a_fc1.astype(np.float32, copy=False),
+                "logits": logits.astype(np.float32, copy=False),
+                "softmax": probs.astype(np.float32, copy=False),
+            }
+
         conv = cpu_model.layers[0]
         relu1 = cpu_model.layers[1]
         flatten = cpu_model.layers[2]
         fc1 = cpu_model.layers[3]
         relu2 = cpu_model.layers[4]
         fc2 = cpu_model.layers[5]
-
         z_conv = conv.forward(x, training=False)
         a_conv = relu1.forward(z_conv, training=False)
         flat = flatten.forward(a_conv, training=False)
@@ -687,8 +953,8 @@ class GPUTrainingPipeline:
 
         # Seed output buffers with NaN to catch partially-written outputs.
         nan_fill = {
-            "z_conv": np.full((self.cfg.batch_size, self.cfg.conv_filters, self.oh, self.ow), np.nan, dtype=np.float32),
-            "a_conv": np.full((self.cfg.batch_size, self.cfg.conv_filters, self.oh, self.ow), np.nan, dtype=np.float32),
+            "z_conv": np.full((self.cfg.batch_size, self.cfg.conv_filters, self.c1_oh, self.c1_ow), np.nan, dtype=np.float32),
+            "a_conv": np.full((self.cfg.batch_size, self.cfg.conv_filters, self.c1_oh, self.c1_ow), np.nan, dtype=np.float32),
             "z_fc1": np.full((self.cfg.batch_size, self.cfg.hidden_units), np.nan, dtype=np.float32),
             "a_fc1": np.full((self.cfg.batch_size, self.cfg.hidden_units), np.nan, dtype=np.float32),
             "logits": np.full((self.cfg.batch_size, self.cfg.num_classes), np.nan, dtype=np.float32),
@@ -705,15 +971,25 @@ class GPUTrainingPipeline:
 
         gpu_intermediates = {
             "z_conv": self.manager.from_device(
-                buffers["z_conv"], (n_cur, self.cfg.conv_filters, self.oh, self.ow), np.dtype(np.float32)
+                buffers["z_conv"], (n_cur, self.cfg.conv_filters, self.c1_oh, self.c1_ow), np.dtype(np.float32)
             ),
             "a_conv": self.manager.from_device(
-                buffers["a_conv"], (n_cur, self.cfg.conv_filters, self.oh, self.ow), np.dtype(np.float32)
+                buffers["a_conv"], (n_cur, self.cfg.conv_filters, self.c1_oh, self.c1_ow), np.dtype(np.float32)
             ),
             "z_fc1": self.manager.from_device(buffers["z_fc1"], (n_cur, self.cfg.hidden_units), np.dtype(np.float32)),
             "a_fc1": self.manager.from_device(buffers["a_fc1"], (n_cur, self.cfg.hidden_units), np.dtype(np.float32)),
             "logits": self.manager.from_device(buffers["logits"], (n_cur, self.cfg.num_classes), np.dtype(np.float32)),
         }
+        if self.use_second_conv:
+            gpu_intermediates["z_conv2"] = self.manager.from_device(
+                buffers["z_conv2"], (n_cur, self.conv2_filters, self.c2_oh, self.c2_ow), np.dtype(np.float32)
+            )
+            gpu_intermediates["a_conv2"] = self.manager.from_device(
+                buffers["a_conv2"], (n_cur, self.conv2_filters, self.c2_oh, self.c2_ow), np.dtype(np.float32)
+            )
+            gpu_intermediates["pool"] = self.manager.from_device(
+                buffers["pool"], (n_cur, self.post_c, self.post_h, self.post_w), np.dtype(np.float32)
+            )
         gpu_intermediates["softmax"] = self._stable_softmax(gpu_intermediates["logits"])
 
         cpu_intermediates = self._cpu_forward_intermediates(x)
@@ -732,7 +1008,10 @@ class GPUTrainingPipeline:
         print(f"[DEBUG] float64 mismatch detected: {'YES' if has_float64 else 'NO'}")
 
         buffer_write_issues: list[str] = []
-        for name in ("z_conv", "a_conv", "z_fc1", "a_fc1", "logits"):
+        check_names = ["z_conv", "a_conv", "z_fc1", "a_fc1", "logits"]
+        if self.use_second_conv:
+            check_names.extend(["z_conv2", "a_conv2", "pool"])
+        for name in check_names:
             if not np.isfinite(gpu_intermediates[name]).all():
                 buffer_write_issues.append(name)
         if buffer_write_issues:
@@ -751,14 +1030,27 @@ class GPUTrainingPipeline:
             f"GPU would_overflow={gpu_overflow[0]} naive_exp_inf={gpu_overflow[1]} max_logit={gpu_overflow[2]:.6g}"
         )
 
-        layer_order = [
-            ("Conv output", "z_conv"),
-            ("After ReLU (conv)", "a_conv"),
-            ("Dense output (fc1)", "z_fc1"),
-            ("After ReLU (fc1)", "a_fc1"),
-            ("Dense output (logits)", "logits"),
-            ("Softmax output", "softmax"),
-        ]
+        if self.use_second_conv:
+            layer_order = [
+                ("Conv1 output", "z_conv"),
+                ("After ReLU (conv1)", "a_conv"),
+                ("Conv2 output", "z_conv2"),
+                ("After ReLU (conv2)", "a_conv2"),
+                ("After MaxPool", "pool"),
+                ("Dense output (fc1)", "z_fc1"),
+                ("After ReLU (fc1)", "a_fc1"),
+                ("Dense output (logits)", "logits"),
+                ("Softmax output", "softmax"),
+            ]
+        else:
+            layer_order = [
+                ("Conv output", "z_conv"),
+                ("After ReLU (conv)", "a_conv"),
+                ("Dense output (fc1)", "z_fc1"),
+                ("After ReLU (fc1)", "a_fc1"),
+                ("Dense output (logits)", "logits"),
+                ("Softmax output", "softmax"),
+            ]
 
         first_divergence: str | None = None
         layer_report: list[dict[str, Any]] = []
@@ -826,9 +1118,10 @@ class GPUTrainingPipeline:
             np.int32(sample_elems),
             np.int32(n_cur),
         )
+
         self.k_conv2d_forward_nchw(
             q,
-            (int(n_cur), int(cfg.conv_filters), int(self.oh * self.ow)),
+            (int(n_cur), int(cfg.conv_filters), int(self.c1_oh * self.c1_ow)),
             None,
             buffers["x"],
             self.w_conv,
@@ -842,23 +1135,72 @@ class GPUTrainingPipeline:
             np.int32(cfg.kernel_size),
             np.int32(cfg.stride),
             np.int32(cfg.padding),
-            np.int32(self.oh),
-            np.int32(self.ow),
+            np.int32(self.c1_oh),
+            np.int32(self.c1_ow),
         )
-        conv_total = n_cur * cfg.conv_filters * self.oh * self.ow
+        conv1_total = n_cur * cfg.conv_filters * self.c1_oh * self.c1_ow
         self.k_relu_forward(
             q,
-            (int(conv_total),),
+            (int(conv1_total),),
             None,
             buffers["z_conv"],
             buffers["a_conv"],
-            np.int32(conv_total),
+            np.int32(conv1_total),
         )
+
+        dense_input = buffers["a_conv"]
+        if self.use_second_conv:
+            self.k_conv2d_forward_nchw(
+                q,
+                (int(n_cur), int(self.conv2_filters), int(self.c2_oh * self.c2_ow)),
+                None,
+                buffers["a_conv"],
+                self.w_conv2,
+                self.b_conv2,
+                buffers["z_conv2"],
+                np.int32(n_cur),
+                np.int32(cfg.conv_filters),
+                np.int32(self.c1_oh),
+                np.int32(self.c1_ow),
+                np.int32(self.conv2_filters),
+                np.int32(cfg.kernel_size),
+                np.int32(cfg.stride),
+                np.int32(cfg.padding),
+                np.int32(self.c2_oh),
+                np.int32(self.c2_ow),
+            )
+            conv2_total = n_cur * self.conv2_filters * self.c2_oh * self.c2_ow
+            self.k_relu_forward(
+                q,
+                (int(conv2_total),),
+                None,
+                buffers["z_conv2"],
+                buffers["a_conv2"],
+                np.int32(conv2_total),
+            )
+            dense_input = buffers["a_conv2"]
+            if self.use_maxpool:
+                self.k_maxpool2x2_forward_nchw(
+                    q,
+                    (int(n_cur), int(self.conv2_filters), int(self.post_h * self.post_w)),
+                    None,
+                    buffers["a_conv2"],
+                    buffers["pool"],
+                    buffers["pool_idx"],
+                    np.int32(n_cur),
+                    np.int32(self.conv2_filters),
+                    np.int32(self.c2_oh),
+                    np.int32(self.c2_ow),
+                    np.int32(self.post_h),
+                    np.int32(self.post_w),
+                )
+                dense_input = buffers["pool"]
+
         self.k_dense_forward(
             q,
             (int(n_cur), int(cfg.hidden_units)),
             None,
-            buffers["a_conv"],
+            dense_input,
             self.w_fc1,
             self.b_fc1,
             buffers["z_fc1"],
@@ -909,21 +1251,35 @@ class GPUTrainingPipeline:
         # Forward-only validation first to pinpoint stage failures.
         self._forward_only(x_dev=x_dev, n_cur=n_cur, sample_elems=sample_elems, buffers=buffers)
         z_conv = self.manager.from_device(
-            buffers["z_conv"], (n_cur, self.cfg.conv_filters, self.oh, self.ow), np.dtype(np.float32)
+            buffers["z_conv"], (n_cur, self.cfg.conv_filters, self.c1_oh, self.c1_ow), np.dtype(np.float32)
         )
         a_conv = self.manager.from_device(
-            buffers["a_conv"], (n_cur, self.cfg.conv_filters, self.oh, self.ow), np.dtype(np.float32)
+            buffers["a_conv"], (n_cur, self.cfg.conv_filters, self.c1_oh, self.c1_ow), np.dtype(np.float32)
         )
         z_fc1 = self.manager.from_device(buffers["z_fc1"], (n_cur, self.cfg.hidden_units), np.dtype(np.float32))
         a_fc1 = self.manager.from_device(buffers["a_fc1"], (n_cur, self.cfg.hidden_units), np.dtype(np.float32))
         logits0 = self.manager.from_device(buffers["logits"], (n_cur, self.cfg.num_classes), np.dtype(np.float32))
-        for name, arr in (
+        checks: list[tuple[str, np.ndarray]] = [
             ("z_conv", z_conv),
             ("a_conv", a_conv),
             ("z_fc1", z_fc1),
             ("a_fc1", a_fc1),
             ("logits", logits0),
-        ):
+        ]
+        if self.use_second_conv:
+            z_conv2 = self.manager.from_device(
+                buffers["z_conv2"], (n_cur, self.conv2_filters, self.c2_oh, self.c2_ow), np.dtype(np.float32)
+            )
+            a_conv2 = self.manager.from_device(
+                buffers["a_conv2"], (n_cur, self.conv2_filters, self.c2_oh, self.c2_ow), np.dtype(np.float32)
+            )
+            checks.extend([("z_conv2", z_conv2), ("a_conv2", a_conv2)])
+            if self.use_maxpool:
+                pool = self.manager.from_device(
+                    buffers["pool"], (n_cur, self.post_c, self.post_h, self.post_w), np.dtype(np.float32)
+                )
+                checks.append(("pool", pool))
+        for name, arr in checks:
             if not np.isfinite(arr).all():
                 raise RuntimeError(f"GPU sanity check failed in forward stage. {self._finite_stats(name, arr)}")
 
@@ -1087,7 +1443,7 @@ class GPUTrainingPipeline:
 
         self.k_conv2d_forward_nchw(
             q,
-            (int(n_cur), int(cfg.conv_filters), int(self.oh * self.ow)),
+            (int(n_cur), int(cfg.conv_filters), int(self.c1_oh * self.c1_ow)),
             None,
             buffers["x"],
             self.w_conv,
@@ -1101,25 +1457,73 @@ class GPUTrainingPipeline:
             np.int32(cfg.kernel_size),
             np.int32(cfg.stride),
             np.int32(cfg.padding),
-            np.int32(self.oh),
-            np.int32(self.ow),
+            np.int32(self.c1_oh),
+            np.int32(self.c1_ow),
         )
 
-        conv_total = n_cur * cfg.conv_filters * self.oh * self.ow
+        conv1_total = n_cur * cfg.conv_filters * self.c1_oh * self.c1_ow
         self.k_relu_forward(
             q,
-            (int(conv_total),),
+            (int(conv1_total),),
             None,
             buffers["z_conv"],
             buffers["a_conv"],
-            np.int32(conv_total),
+            np.int32(conv1_total),
         )
+
+        dense_input = buffers["a_conv"]
+        if self.use_second_conv:
+            self.k_conv2d_forward_nchw(
+                q,
+                (int(n_cur), int(self.conv2_filters), int(self.c2_oh * self.c2_ow)),
+                None,
+                buffers["a_conv"],
+                self.w_conv2,
+                self.b_conv2,
+                buffers["z_conv2"],
+                np.int32(n_cur),
+                np.int32(cfg.conv_filters),
+                np.int32(self.c1_oh),
+                np.int32(self.c1_ow),
+                np.int32(self.conv2_filters),
+                np.int32(cfg.kernel_size),
+                np.int32(cfg.stride),
+                np.int32(cfg.padding),
+                np.int32(self.c2_oh),
+                np.int32(self.c2_ow),
+            )
+            conv2_total = n_cur * self.conv2_filters * self.c2_oh * self.c2_ow
+            self.k_relu_forward(
+                q,
+                (int(conv2_total),),
+                None,
+                buffers["z_conv2"],
+                buffers["a_conv2"],
+                np.int32(conv2_total),
+            )
+            dense_input = buffers["a_conv2"]
+            if self.use_maxpool:
+                self.k_maxpool2x2_forward_nchw(
+                    q,
+                    (int(n_cur), int(self.conv2_filters), int(self.post_h * self.post_w)),
+                    None,
+                    buffers["a_conv2"],
+                    buffers["pool"],
+                    buffers["pool_idx"],
+                    np.int32(n_cur),
+                    np.int32(self.conv2_filters),
+                    np.int32(self.c2_oh),
+                    np.int32(self.c2_ow),
+                    np.int32(self.post_h),
+                    np.int32(self.post_w),
+                )
+                dense_input = buffers["pool"]
 
         self.k_dense_forward(
             q,
             (int(n_cur), int(cfg.hidden_units)),
             None,
-            buffers["a_conv"],
+            dense_input,
             self.w_fc1,
             self.b_fc1,
             buffers["z_fc1"],
@@ -1209,7 +1613,7 @@ class GPUTrainingPipeline:
             q,
             (int(self.flat_features), int(cfg.hidden_units)),
             None,
-            buffers["a_conv"],
+            dense_input,
             buffers["d_z_fc1"],
             self.gw_fc1,
             np.int32(n_cur),
@@ -1225,27 +1629,114 @@ class GPUTrainingPipeline:
             np.int32(n_cur),
             np.int32(cfg.hidden_units),
         )
+        d_flat_target = buffers["d_a_conv"] if (not self.use_second_conv or self.use_maxpool) else buffers["d_a_conv2"]
         self.k_dense_backward_input(
             q,
             (int(n_cur), int(self.flat_features)),
             None,
             buffers["d_z_fc1"],
             self.w_fc1,
-            buffers["d_a_conv"],
+            d_flat_target,
             np.int32(n_cur),
             np.int32(self.flat_features),
             np.int32(cfg.hidden_units),
         )
 
-        self.k_relu_backward(
-            q,
-            (int(conv_total),),
-            None,
-            buffers["d_a_conv"],
-            buffers["z_conv"],
-            buffers["d_z_conv"],
-            np.int32(conv_total),
-        )
+        # Backprop through second conv/pool stack if enabled.
+        if self.use_second_conv:
+            if self.use_maxpool:
+                self.k_maxpool2x2_backward_nchw(
+                    q,
+                    (int(n_cur), int(self.conv2_filters), int(self.c2_oh * self.c2_ow)),
+                    None,
+                    buffers["d_a_conv"],
+                    buffers["pool_idx"],
+                    buffers["d_a_conv2"],
+                    np.int32(n_cur),
+                    np.int32(self.conv2_filters),
+                    np.int32(self.c2_oh),
+                    np.int32(self.c2_ow),
+                    np.int32(self.post_h),
+                    np.int32(self.post_w),
+                )
+
+            conv2_total = n_cur * self.conv2_filters * self.c2_oh * self.c2_ow
+            self.k_relu_backward(
+                q,
+                (int(conv2_total),),
+                None,
+                buffers["d_a_conv2"],
+                buffers["z_conv2"],
+                buffers["d_z_conv2"],
+                np.int32(conv2_total),
+            )
+
+            self.k_conv2d_backward_weight_nchw(
+                q,
+                (int(self.conv2_filters), int(cfg.conv_filters), int(cfg.kernel_size * cfg.kernel_size)),
+                None,
+                buffers["a_conv"],
+                buffers["d_z_conv2"],
+                self.gw_conv2,
+                np.int32(n_cur),
+                np.int32(cfg.conv_filters),
+                np.int32(self.c1_oh),
+                np.int32(self.c1_ow),
+                np.int32(self.conv2_filters),
+                np.int32(cfg.kernel_size),
+                np.int32(cfg.stride),
+                np.int32(cfg.padding),
+                np.int32(self.c2_oh),
+                np.int32(self.c2_ow),
+            )
+            self.k_conv2d_backward_bias_nchw(
+                q,
+                (int(self.conv2_filters),),
+                None,
+                buffers["d_z_conv2"],
+                self.gb_conv2,
+                np.int32(n_cur),
+                np.int32(self.conv2_filters),
+                np.int32(self.c2_oh),
+                np.int32(self.c2_ow),
+            )
+            self.k_conv2d_backward_input_nchw(
+                q,
+                (int(n_cur), int(cfg.conv_filters), int(self.c1_oh * self.c1_ow)),
+                None,
+                buffers["d_z_conv2"],
+                self.w_conv2,
+                buffers["d_a_conv1"],
+                np.int32(n_cur),
+                np.int32(cfg.conv_filters),
+                np.int32(self.c1_oh),
+                np.int32(self.c1_ow),
+                np.int32(self.conv2_filters),
+                np.int32(cfg.kernel_size),
+                np.int32(cfg.stride),
+                np.int32(cfg.padding),
+                np.int32(self.c2_oh),
+                np.int32(self.c2_ow),
+            )
+            self.k_relu_backward(
+                q,
+                (int(conv1_total),),
+                None,
+                buffers["d_a_conv1"],
+                buffers["z_conv"],
+                buffers["d_z_conv"],
+                np.int32(conv1_total),
+            )
+        else:
+            self.k_relu_backward(
+                q,
+                (int(conv1_total),),
+                None,
+                buffers["d_a_conv"],
+                buffers["z_conv"],
+                buffers["d_z_conv"],
+                np.int32(conv1_total),
+            )
 
         self.k_conv2d_backward_weight_nchw(
             q,
@@ -1262,8 +1753,8 @@ class GPUTrainingPipeline:
             np.int32(cfg.kernel_size),
             np.int32(cfg.stride),
             np.int32(cfg.padding),
-            np.int32(self.oh),
-            np.int32(self.ow),
+            np.int32(self.c1_oh),
+            np.int32(self.c1_ow),
         )
         self.k_conv2d_backward_bias_nchw(
             q,
@@ -1273,8 +1764,8 @@ class GPUTrainingPipeline:
             self.gb_conv,
             np.int32(n_cur),
             np.int32(cfg.conv_filters),
-            np.int32(self.oh),
-            np.int32(self.ow),
+            np.int32(self.c1_oh),
+            np.int32(self.c1_ow),
         )
         self.k_conv2d_backward_input_nchw(
             q,
@@ -1291,23 +1782,51 @@ class GPUTrainingPipeline:
             np.int32(cfg.kernel_size),
             np.int32(cfg.stride),
             np.int32(cfg.padding),
-            np.int32(self.oh),
-            np.int32(self.ow),
+            np.int32(self.c1_oh),
+            np.int32(self.c1_ow),
         )
 
-        self._sgd_step(cfg.learning_rate)
+        self._optimizer_step(cfg.learning_rate)
         q.finish()
+
+    def _optimizer_step(self, lr: float) -> None:
+        if self.cfg.optimizer.lower() == "adam":
+            self._adam_step_count += 1
+            self._adam_step(
+                lr=lr,
+                t=self._adam_step_count,
+                beta1=self.cfg.adam_beta1,
+                beta2=self.cfg.adam_beta2,
+                eps=self.cfg.adam_eps,
+            )
+            return
+        self._sgd_step(lr)
 
     def _sgd_step(self, lr: float) -> None:
         q = self.manager.queue
         params_and_grads = [
             (self.w_conv, self.gw_conv, self.cfg.conv_filters * self.cfg.input_channels * self.cfg.kernel_size * self.cfg.kernel_size),
             (self.b_conv, self.gb_conv, self.cfg.conv_filters),
-            (self.w_fc1, self.gw_fc1, self.flat_features * self.cfg.hidden_units),
-            (self.b_fc1, self.gb_fc1, self.cfg.hidden_units),
-            (self.w_fc2, self.gw_fc2, self.cfg.hidden_units * self.cfg.num_classes),
-            (self.b_fc2, self.gb_fc2, self.cfg.num_classes),
         ]
+        if self.use_second_conv:
+            params_and_grads.extend(
+                [
+                    (
+                        self.w_conv2,
+                        self.gw_conv2,
+                        self.conv2_filters * self.cfg.conv_filters * self.cfg.kernel_size * self.cfg.kernel_size,
+                    ),
+                    (self.b_conv2, self.gb_conv2, self.conv2_filters),
+                ]
+            )
+        params_and_grads.extend(
+            [
+                (self.w_fc1, self.gw_fc1, self.flat_features * self.cfg.hidden_units),
+                (self.b_fc1, self.gb_fc1, self.cfg.hidden_units),
+                (self.w_fc2, self.gw_fc2, self.cfg.hidden_units * self.cfg.num_classes),
+                (self.b_fc2, self.gb_fc2, self.cfg.num_classes),
+            ]
+        )
         for param, grad, n in params_and_grads:
             self.k_sgd_update(
                 q,
@@ -1316,6 +1835,25 @@ class GPUTrainingPipeline:
                 param,
                 grad,
                 np.float32(lr),
+                np.int32(n),
+            )
+
+    def _adam_step(self, lr: float, t: int, beta1: float, beta2: float, eps: float) -> None:
+        q = self.manager.queue
+        for param, grad, m, v, n in self._adam_states:
+            self.k_adam_update(
+                q,
+                (int(n),),
+                None,
+                param,
+                grad,
+                m,
+                v,
+                np.float32(lr),
+                np.float32(beta1),
+                np.float32(beta2),
+                np.float32(eps),
+                np.int32(t),
                 np.int32(n),
             )
 
@@ -1355,7 +1893,7 @@ class GPUTrainingPipeline:
 
             self.k_conv2d_forward_nchw(
                 self.manager.queue,
-                (int(n_cur), int(cfg.conv_filters), int(self.oh * self.ow)),
+                (int(n_cur), int(cfg.conv_filters), int(self.c1_oh * self.c1_ow)),
                 None,
                 buffers["x"],
                 self.w_conv,
@@ -1369,10 +1907,10 @@ class GPUTrainingPipeline:
                 np.int32(cfg.kernel_size),
                 np.int32(cfg.stride),
                 np.int32(cfg.padding),
-                np.int32(self.oh),
-                np.int32(self.ow),
+                np.int32(self.c1_oh),
+                np.int32(self.c1_ow),
             )
-            conv_total = n_cur * cfg.conv_filters * self.oh * self.ow
+            conv_total = n_cur * cfg.conv_filters * self.c1_oh * self.c1_ow
             self.k_relu_forward(
                 self.manager.queue,
                 (int(conv_total),),
@@ -1382,11 +1920,59 @@ class GPUTrainingPipeline:
                 np.int32(conv_total),
             )
 
+            dense_input = buffers["a_conv"]
+            if self.use_second_conv:
+                self.k_conv2d_forward_nchw(
+                    self.manager.queue,
+                    (int(n_cur), int(self.conv2_filters), int(self.c2_oh * self.c2_ow)),
+                    None,
+                    buffers["a_conv"],
+                    self.w_conv2,
+                    self.b_conv2,
+                    buffers["z_conv2"],
+                    np.int32(n_cur),
+                    np.int32(cfg.conv_filters),
+                    np.int32(self.c1_oh),
+                    np.int32(self.c1_ow),
+                    np.int32(self.conv2_filters),
+                    np.int32(cfg.kernel_size),
+                    np.int32(cfg.stride),
+                    np.int32(cfg.padding),
+                    np.int32(self.c2_oh),
+                    np.int32(self.c2_ow),
+                )
+                conv2_total = n_cur * self.conv2_filters * self.c2_oh * self.c2_ow
+                self.k_relu_forward(
+                    self.manager.queue,
+                    (int(conv2_total),),
+                    None,
+                    buffers["z_conv2"],
+                    buffers["a_conv2"],
+                    np.int32(conv2_total),
+                )
+                dense_input = buffers["a_conv2"]
+                if self.use_maxpool:
+                    self.k_maxpool2x2_forward_nchw(
+                        self.manager.queue,
+                        (int(n_cur), int(self.conv2_filters), int(self.post_h * self.post_w)),
+                        None,
+                        buffers["a_conv2"],
+                        buffers["pool"],
+                        buffers["pool_idx"],
+                        np.int32(n_cur),
+                        np.int32(self.conv2_filters),
+                        np.int32(self.c2_oh),
+                        np.int32(self.c2_ow),
+                        np.int32(self.post_h),
+                        np.int32(self.post_w),
+                    )
+                    dense_input = buffers["pool"]
+
             self.k_dense_forward(
                 self.manager.queue,
                 (int(n_cur), int(cfg.hidden_units)),
                 None,
-                buffers["a_conv"],
+                dense_input,
                 self.w_fc1,
                 self.b_fc1,
                 buffers["z_fc1"],
@@ -1456,18 +2042,38 @@ class GPUTrainingPipeline:
     def to_cpu_model(self) -> CNNModel:
         """Materialize current GPU weights into a CPU CNNModel instance."""
         cfg = self.cfg
-        model = CNNModel(
-            [
+        if self.use_second_conv:
+            layers: list[Any] = [
                 Conv2D(in_channels=1, out_channels=cfg.conv_filters, kernel_size=3, stride=1, padding=0),
                 ReLU(),
-                Flatten(),
-                Dense(in_features=self.flat_features, out_features=cfg.hidden_units),
+                Conv2D(in_channels=cfg.conv_filters, out_channels=self.conv2_filters, kernel_size=3, stride=1, padding=0),
                 ReLU(),
-                Dense(in_features=cfg.hidden_units, out_features=cfg.num_classes),
             ]
-        )
+            if self.use_maxpool:
+                layers.append(MaxPool2D(kernel_size=2, stride=2))
+            layers.extend(
+                [
+                    Flatten(),
+                    Dense(in_features=self.flat_features, out_features=cfg.hidden_units),
+                    ReLU(),
+                    Dense(in_features=cfg.hidden_units, out_features=cfg.num_classes),
+                ]
+            )
+            model = CNNModel(layers)
+        else:
+            model = CNNModel(
+                [
+                    Conv2D(in_channels=1, out_channels=cfg.conv_filters, kernel_size=3, stride=1, padding=0),
+                    ReLU(),
+                    Flatten(),
+                    Dense(in_features=self.flat_features, out_features=cfg.hidden_units),
+                    ReLU(),
+                    Dense(in_features=cfg.hidden_units, out_features=cfg.num_classes),
+                ]
+            )
         params = model.parameters()
-        if len(params) != 6:
+        expected_params = 8 if self.use_second_conv else 6
+        if len(params) != expected_params:
             raise RuntimeError(f"Unexpected parameter count in CPU model: {len(params)}.")
 
         host_w_conv = self.manager.from_device(
@@ -1476,6 +2082,12 @@ class GPUTrainingPipeline:
             np.dtype(np.float32),
         )
         host_b_conv = self.manager.from_device(self.b_conv, (cfg.conv_filters,), np.dtype(np.float32))
+        host_w_conv2 = self.manager.from_device(
+            self.w_conv2,
+            (self.conv2_filters, cfg.conv_filters, cfg.kernel_size, cfg.kernel_size),
+            np.dtype(np.float32),
+        )
+        host_b_conv2 = self.manager.from_device(self.b_conv2, (self.conv2_filters,), np.dtype(np.float32))
         host_w_fc1 = self.manager.from_device(
             self.w_fc1,
             (self.flat_features, cfg.hidden_units),
@@ -1491,10 +2103,18 @@ class GPUTrainingPipeline:
 
         params[0][...] = host_w_conv
         params[1][...] = host_b_conv
-        params[2][...] = host_w_fc1
-        params[3][...] = host_b_fc1
-        params[4][...] = host_w_fc2
-        params[5][...] = host_b_fc2
+        if self.use_second_conv:
+            params[2][...] = host_w_conv2
+            params[3][...] = host_b_conv2
+            params[4][...] = host_w_fc1
+            params[5][...] = host_b_fc1
+            params[6][...] = host_w_fc2
+            params[7][...] = host_b_fc2
+        else:
+            params[2][...] = host_w_fc1
+            params[3][...] = host_b_fc1
+            params[4][...] = host_w_fc2
+            params[5][...] = host_b_fc2
         return model
 
     def save_weights_npz(self, file_path: str | Path) -> Path:

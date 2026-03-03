@@ -37,11 +37,11 @@ from PyQt6.QtWidgets import (
 )
 
 from dataset import load_mnist_from_files
-from layers import Conv2D, Dense, Flatten, ReLU
+from layers import Conv2D, Dense, Flatten, MaxPool2D, ReLU
 from loss import CrossEntropy
 from model import CNNModel
 from opencl_backend import OpenCLManager
-from optimizers import SGD
+from optimizers import Adam, SGD
 from gpu_pipeline import GPUTrainConfig, GPUTrainingPipeline
 from trainer import TrainConfig, Trainer
 
@@ -58,6 +58,10 @@ class Preset:
     hidden_units: int
     train_limit: int
     test_limit: int
+    conv2_filters: int | None = None
+    optimizer: str = "sgd"
+    use_second_conv: bool = False
+    use_maxpool: bool = False
 
 
 @dataclass(frozen=True)
@@ -192,20 +196,110 @@ PRESETS: dict[str, Preset] = {
         train_limit=60000,
         test_limit=10000,
     ),
+    # v4 (2xConv + MaxPool + Adam)
+    "v4/Mini": Preset(
+        key="v4/Mini",
+        version="v4",
+        name="Mini",
+        epochs=4,
+        batch_size=64,
+        lr=0.0015,
+        conv_filters=16,
+        conv2_filters=24,
+        hidden_units=128,
+        train_limit=12000,
+        test_limit=2000,
+        optimizer="adam",
+        use_second_conv=True,
+        use_maxpool=True,
+    ),
+    "v4/Normal": Preset(
+        key="v4/Normal",
+        version="v4",
+        name="Normal",
+        epochs=8,
+        batch_size=64,
+        lr=0.0010,
+        conv_filters=24,
+        conv2_filters=36,
+        hidden_units=192,
+        train_limit=30000,
+        test_limit=5000,
+        optimizer="adam",
+        use_second_conv=True,
+        use_maxpool=True,
+    ),
+    "v4/Pro": Preset(
+        key="v4/Pro",
+        version="v4",
+        name="Pro",
+        epochs=12,
+        batch_size=64,
+        lr=0.0008,
+        conv_filters=32,
+        conv2_filters=48,
+        hidden_units=256,
+        train_limit=60000,
+        test_limit=10000,
+        optimizer="adam",
+        use_second_conv=True,
+        use_maxpool=True,
+    ),
+    "v4/Extreme": Preset(
+        key="v4/Extreme",
+        version="v4",
+        name="Extreme",
+        epochs=16,
+        batch_size=64,
+        lr=0.0006,
+        conv_filters=40,
+        conv2_filters=64,
+        hidden_units=320,
+        train_limit=60000,
+        test_limit=10000,
+        optimizer="adam",
+        use_second_conv=True,
+        use_maxpool=True,
+    ),
 }
 
 
-def build_model(conv_filters: int, hidden_units: int) -> CNNModel:
-    # Input (N, 1, 28, 28) -> Conv3x3 stride1 pad0 => (N, conv_filters, 26, 26)
-    flattened = conv_filters * 26 * 26
+def build_model(preset: Preset) -> CNNModel:
+    # v4: Conv3x3 -> ReLU -> Conv3x3 -> ReLU -> MaxPool2x2 -> Flatten -> Dense -> ReLU -> Dense
+    if preset.use_second_conv:
+        conv2_filters = int(preset.conv2_filters or (preset.conv_filters * 2))
+        c1_h = 26  # 28 -> conv3x3 valid
+        c2_h = c1_h - 2  # second conv3x3 valid
+        post_h = c2_h // 2 if preset.use_maxpool else c2_h
+        flattened = conv2_filters * post_h * post_h
+        layers: list = [
+            Conv2D(in_channels=1, out_channels=preset.conv_filters, kernel_size=3, stride=1, padding=0),
+            ReLU(),
+            Conv2D(in_channels=preset.conv_filters, out_channels=conv2_filters, kernel_size=3, stride=1, padding=0),
+            ReLU(),
+        ]
+        if preset.use_maxpool:
+            layers.append(MaxPool2D(kernel_size=2, stride=2))
+        layers.extend(
+            [
+                Flatten(),
+                Dense(in_features=flattened, out_features=preset.hidden_units),
+                ReLU(),
+                Dense(in_features=preset.hidden_units, out_features=10),
+            ]
+        )
+        return CNNModel(layers)
+
+    # v1-v3 baseline path.
+    flattened = preset.conv_filters * 26 * 26
     return CNNModel(
         [
-            Conv2D(in_channels=1, out_channels=conv_filters, kernel_size=3, stride=1, padding=0),
+            Conv2D(in_channels=1, out_channels=preset.conv_filters, kernel_size=3, stride=1, padding=0),
             ReLU(),
             Flatten(),
-            Dense(in_features=flattened, out_features=hidden_units),
+            Dense(in_features=flattened, out_features=preset.hidden_units),
             ReLU(),
-            Dense(in_features=hidden_units, out_features=10),
+            Dense(in_features=preset.hidden_units, out_features=10),
         ]
     )
 
@@ -236,9 +330,9 @@ class TrainingWorker(QObject):
             x_test = x_test[: self.preset.test_limit]
             y_test = y_test[: self.preset.test_limit]
 
-            model = build_model(self.preset.conv_filters, self.preset.hidden_units)
+            model = build_model(self.preset)
             loss_fn = CrossEntropy()
-            optimizer = SGD(lr=self.preset.lr)
+            optimizer = Adam(lr=self.preset.lr) if self.preset.optimizer.lower() == "adam" else SGD(lr=self.preset.lr)
             trainer = Trainer(
                 model=model,
                 loss_fn=loss_fn,
@@ -308,9 +402,13 @@ class GPUTrainingWorker(QObject):
                 config=GPUTrainConfig(
                     epochs=self.preset.epochs,
                     batch_size=self.preset.batch_size,
-                    learning_rate=min(0.01, self.preset.lr),
+                    learning_rate=self.preset.lr,
                     conv_filters=self.preset.conv_filters,
+                    conv2_filters=int(self.preset.conv2_filters or 0),
                     hidden_units=self.preset.hidden_units,
+                    use_second_conv=self.preset.use_second_conv,
+                    use_maxpool=self.preset.use_maxpool,
+                    optimizer=self.preset.optimizer,
                     debug_mode=os.getenv("CNN_DEBUG_MODE", "0").strip().lower() in {"1", "true", "yes", "on"},
                     debug_batch_size=max(1, int(os.getenv("CNN_DEBUG_BATCH_SIZE", "8"))),
                 ),
@@ -734,7 +832,7 @@ class MainWindow(QMainWindow):
         loaded_preset_key: str | None = None
         errors: list[str] = []
         for preset_key, preset in PRESETS.items():
-            candidate = build_model(preset.conv_filters, preset.hidden_units)
+            candidate = build_model(preset)
             try:
                 candidate.load_weights(file_path)
                 loaded_model = candidate
@@ -912,12 +1010,17 @@ class MainWindow(QMainWindow):
         self.preset_combo.addItem("v3/Normal")
         self.preset_combo.addItem("v3/Pro")
         self.preset_combo.addItem("v3/Extreme")
+        self.preset_combo.addItem("v4")
+        self.preset_combo.addItem("v4/Mini")
+        self.preset_combo.addItem("v4/Normal")
+        self.preset_combo.addItem("v4/Pro")
+        self.preset_combo.addItem("v4/Extreme")
 
-        for idx in (0, 4, 8):
+        for idx in (0, 4, 8, 13):
             item = self.preset_combo.model().item(idx)
             if item is not None:
                 item.setEnabled(False)
-        self.preset_combo.setCurrentText("v3/Normal")
+        self.preset_combo.setCurrentText("v4/Normal")
 
     def _current_preset(self) -> Preset | None:
         key = self.preset_combo.currentText()
@@ -931,16 +1034,29 @@ class MainWindow(QMainWindow):
     def _update_preset_details(self) -> None:
         preset = self._current_preset()
         if preset is None:
-            self.preset_details_label.setText("Select a preset entry (e.g. v2/Normal).")
+            self.preset_details_label.setText("Select a preset entry (e.g. v4/Normal).")
             return
+
+        if preset.use_second_conv:
+            c2 = int(preset.conv2_filters or (preset.conv_filters * 2))
+            model_desc = (
+                f"Conv2D(3x3,{preset.conv_filters}) -> ReLU -> Conv2D(3x3,{c2}) -> ReLU"
+                + (" -> MaxPool2D(2x2)" if preset.use_maxpool else "")
+                + f" -> Flatten -> Dense({preset.hidden_units}) -> ReLU -> Dense(10)"
+            )
+        else:
+            model_desc = (
+                f"Conv2D(3x3,{preset.conv_filters}) -> ReLU -> Flatten -> Dense({preset.hidden_units}) -> ReLU -> Dense(10)"
+            )
 
         lines = [
             f"Version: {preset.version}",
-            f"Model: Conv2D(3x3,{preset.conv_filters}) -> ReLU -> Flatten -> Dense({preset.hidden_units}) -> ReLU -> Dense(10)",
+            f"Model: {model_desc}",
+            f"Optimizer: {preset.optimizer.upper()}",
             f"Epochs: {preset.epochs} | Batch: {preset.batch_size} | LR: {preset.lr}",
             f"Train limit: {preset.train_limit} | Test limit: {preset.test_limit}",
         ]
-        if preset.key == "v3/Extreme":
+        if preset.key in {"v3/Extreme", "v4/Extreme"}:
             lines.append("Note: highest-capacity preset; intended to push toward >=99% test accuracy.")
         self.preset_details_label.setText("\n".join(lines))
 
