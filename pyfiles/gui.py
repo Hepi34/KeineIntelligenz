@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import time
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -37,7 +38,7 @@ from PyQt6.QtWidgets import (
 )
 
 from dataset import load_mnist_from_files
-from layers import Conv2D, Dense, Flatten, MaxPool2D, ReLU
+from layers import Conv2D, Dense, Dropout, Flatten, MaxPool2D, ReLU
 from loss import CrossEntropy
 from model import CNNModel
 from opencl_backend import OpenCLManager
@@ -62,6 +63,11 @@ class Preset:
     optimizer: str = "sgd"
     use_second_conv: bool = False
     use_maxpool: bool = False
+    dropout_rate: float = 0.0
+    weight_decay: float = 0.0
+    lr_decay_after_epoch: int | None = None
+    lr_decay_factor: float = 1.0
+    restore_best: bool = False
 
 
 @dataclass(frozen=True)
@@ -261,6 +267,91 @@ PRESETS: dict[str, Preset] = {
         use_second_conv=True,
         use_maxpool=True,
     ),
+    # v5 (2xConv + MaxPool + Adam) tuned for fast and efficient 99%+
+    "v5/Mini": Preset(
+        key="v5/Mini",
+        version="v5",
+        name="Mini",
+        epochs=3,
+        batch_size=64,
+        lr=0.0010,
+        conv_filters=16,
+        conv2_filters=24,
+        hidden_units=128,
+        train_limit=12000,
+        test_limit=2000,
+        optimizer="adam",
+        use_second_conv=True,
+        use_maxpool=True,
+        dropout_rate=0.30,
+        weight_decay=1e-4,
+        lr_decay_after_epoch=2,
+        lr_decay_factor=0.5,
+        restore_best=True,
+    ),
+    "v5/Normal": Preset(
+        key="v5/Normal",
+        version="v5",
+        name="Normal",
+        epochs=3,
+        batch_size=96,
+        lr=0.0010,
+        conv_filters=24,
+        conv2_filters=36,
+        hidden_units=176,
+        train_limit=28000,
+        test_limit=10000,
+        optimizer="adam",
+        use_second_conv=True,
+        use_maxpool=True,
+        dropout_rate=0.28,
+        weight_decay=1e-4,
+        lr_decay_after_epoch=2,
+        lr_decay_factor=0.5,
+        restore_best=True,
+    ),
+    "v5/Pro": Preset(
+        key="v5/Pro",
+        version="v5",
+        name="Pro",
+        epochs=4,
+        batch_size=96,
+        lr=0.0009,
+        conv_filters=28,
+        conv2_filters=44,
+        hidden_units=224,
+        train_limit=50000,
+        test_limit=10000,
+        optimizer="adam",
+        use_second_conv=True,
+        use_maxpool=True,
+        dropout_rate=0.24,
+        weight_decay=8e-5,
+        lr_decay_after_epoch=2,
+        lr_decay_factor=0.5,
+        restore_best=True,
+    ),
+    "v5/Extreme": Preset(
+        key="v5/Extreme",
+        version="v5",
+        name="Extreme",
+        epochs=5,
+        batch_size=128,
+        lr=0.0008,
+        conv_filters=32,
+        conv2_filters=48,
+        hidden_units=256,
+        train_limit=60000,
+        test_limit=10000,
+        optimizer="adam",
+        use_second_conv=True,
+        use_maxpool=True,
+        dropout_rate=0.18,
+        weight_decay=5e-5,
+        lr_decay_after_epoch=2,
+        lr_decay_factor=0.5,
+        restore_best=True,
+    ),
 }
 
 
@@ -285,9 +376,11 @@ def build_model(preset: Preset) -> CNNModel:
                 Flatten(),
                 Dense(in_features=flattened, out_features=preset.hidden_units),
                 ReLU(),
-                Dense(in_features=preset.hidden_units, out_features=10),
             ]
         )
+        if preset.dropout_rate > 0.0:
+            layers.append(Dropout(rate=preset.dropout_rate))
+        layers.append(Dense(in_features=preset.hidden_units, out_features=10))
         return CNNModel(layers)
 
     # v1-v3 baseline path.
@@ -332,7 +425,11 @@ class TrainingWorker(QObject):
 
             model = build_model(self.preset)
             loss_fn = CrossEntropy()
-            optimizer = Adam(lr=self.preset.lr) if self.preset.optimizer.lower() == "adam" else SGD(lr=self.preset.lr)
+            optimizer = (
+                Adam(lr=self.preset.lr, weight_decay=self.preset.weight_decay)
+                if self.preset.optimizer.lower() == "adam"
+                else SGD(lr=self.preset.lr, weight_decay=self.preset.weight_decay)
+            )
             trainer = Trainer(
                 model=model,
                 loss_fn=loss_fn,
@@ -346,8 +443,17 @@ class TrainingWorker(QObject):
             )
 
             history: dict[str, list[float]] = {"loss": [], "accuracy": [], "epoch_time": []}
+            base_lr = float(self.preset.lr)
+            best_acc = -1.0
+            best_params: list[np.ndarray] | None = None
 
             for epoch in range(1, self.preset.epochs + 1):
+                if hasattr(optimizer, "lr"):
+                    if self.preset.lr_decay_after_epoch is not None and epoch > self.preset.lr_decay_after_epoch:
+                        decay_steps = epoch - self.preset.lr_decay_after_epoch
+                        optimizer.lr = float(base_lr * (self.preset.lr_decay_factor ** decay_steps))
+                    else:
+                        optimizer.lr = float(base_lr)
                 start = time.perf_counter()
                 train_metrics = trainer.train_epoch(x_train, y_train)
                 eval_metrics = trainer.evaluate(x_test, y_test)
@@ -358,9 +464,15 @@ class TrainingWorker(QObject):
                 history["loss"].append(loss)
                 history["accuracy"].append(acc)
                 history["epoch_time"].append(sec)
+                if self.preset.restore_best and acc > best_acc:
+                    best_acc = acc
+                    best_params = [param.copy() for param in model.parameters()]
 
                 self.progress.emit(epoch, loss, acc, sec, history.copy())
 
+            if self.preset.restore_best and best_params is not None:
+                for param, best in zip(model.parameters(), best_params, strict=True):
+                    param[...] = best
             self.finished.emit(history, model)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
@@ -408,7 +520,12 @@ class GPUTrainingWorker(QObject):
                     hidden_units=self.preset.hidden_units,
                     use_second_conv=self.preset.use_second_conv,
                     use_maxpool=self.preset.use_maxpool,
+                    dropout_rate=self.preset.dropout_rate,
                     optimizer=self.preset.optimizer,
+                    weight_decay=self.preset.weight_decay,
+                    lr_decay_after_epoch=self.preset.lr_decay_after_epoch,
+                    lr_decay_factor=self.preset.lr_decay_factor,
+                    restore_best=self.preset.restore_best,
                     debug_mode=os.getenv("CNN_DEBUG_MODE", "0").strip().lower() in {"1", "true", "yes", "on"},
                     debug_batch_size=max(1, int(os.getenv("CNN_DEBUG_BATCH_SIZE", "8"))),
                 ),
@@ -797,7 +914,14 @@ class MainWindow(QMainWindow):
             default_save_dir.mkdir(parents=True, exist_ok=True)
             default_save_path = default_save_dir / file_name
             try:
-                self.current_model.save_weights(default_save_path)
+                self.current_model.save_weights(
+                    default_save_path,
+                    metadata={
+                        "preset_key": self._active_preset_key or "",
+                        "version": version,
+                        "device": device_name,
+                    },
+                )
                 self.current_model_path = default_save_path
                 self.model_file_label.setText(f"Model file: {default_save_path}")
             except Exception:
@@ -831,7 +955,26 @@ class MainWindow(QMainWindow):
         loaded_model: CNNModel | None = None
         loaded_preset_key: str | None = None
         errors: list[str] = []
-        for preset_key, preset in PRESETS.items():
+
+        try:
+            metadata = CNNModel.load_metadata(file_path)
+        except Exception:
+            metadata = {}
+        preferred_key = metadata.get("preset_key", "").strip()
+        inferred_version = ""
+        match = re.search(r"(v\d+)", Path(file_path).stem.lower())
+        if match is not None:
+            inferred_version = match.group(1)
+
+        ordered_keys: list[str] = []
+        if preferred_key in PRESETS:
+            ordered_keys.append(preferred_key)
+        if inferred_version:
+            ordered_keys.extend([k for k in PRESETS if k.startswith(f"{inferred_version}/") and k not in ordered_keys])
+        ordered_keys.extend([k for k in PRESETS if k not in ordered_keys])
+
+        for preset_key in ordered_keys:
+            preset = PRESETS[preset_key]
             candidate = build_model(preset)
             try:
                 candidate.load_weights(file_path)
@@ -1015,12 +1158,17 @@ class MainWindow(QMainWindow):
         self.preset_combo.addItem("v4/Normal")
         self.preset_combo.addItem("v4/Pro")
         self.preset_combo.addItem("v4/Extreme")
+        self.preset_combo.addItem("v5")
+        self.preset_combo.addItem("v5/Mini")
+        self.preset_combo.addItem("v5/Normal")
+        self.preset_combo.addItem("v5/Pro")
+        self.preset_combo.addItem("v5/Extreme")
 
-        for idx in (0, 4, 8, 13):
+        for idx in (0, 4, 8, 13, 18):
             item = self.preset_combo.model().item(idx)
             if item is not None:
                 item.setEnabled(False)
-        self.preset_combo.setCurrentText("v4/Normal")
+        self.preset_combo.setCurrentText("v5/Normal")
 
     def _current_preset(self) -> Preset | None:
         key = self.preset_combo.currentText()
@@ -1034,7 +1182,7 @@ class MainWindow(QMainWindow):
     def _update_preset_details(self) -> None:
         preset = self._current_preset()
         if preset is None:
-            self.preset_details_label.setText("Select a preset entry (e.g. v4/Normal).")
+            self.preset_details_label.setText("Select a preset entry (e.g. v5/Normal).")
             return
 
         if preset.use_second_conv:
@@ -1053,10 +1201,20 @@ class MainWindow(QMainWindow):
             f"Version: {preset.version}",
             f"Model: {model_desc}",
             f"Optimizer: {preset.optimizer.upper()}",
+            (f"Dropout: {preset.dropout_rate:.2f}" if preset.dropout_rate > 0.0 else "Dropout: off"),
             f"Epochs: {preset.epochs} | Batch: {preset.batch_size} | LR: {preset.lr}",
+            (
+                f"L2 weight decay: {preset.weight_decay}"
+                + (
+                    f" | LR decay: x{preset.lr_decay_factor} after epoch {preset.lr_decay_after_epoch}"
+                    if preset.lr_decay_after_epoch is not None
+                    else ""
+                )
+            ),
+            f"Restore best epoch: {'on' if preset.restore_best else 'off'}",
             f"Train limit: {preset.train_limit} | Test limit: {preset.test_limit}",
         ]
-        if preset.key in {"v3/Extreme", "v4/Extreme"}:
+        if preset.key in {"v4/Extreme", "v5/Extreme"}:
             lines.append("Note: highest-capacity preset; intended to push toward >=99% test accuracy.")
         self.preset_details_label.setText("\n".join(lines))
 

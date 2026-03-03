@@ -35,10 +35,13 @@ class Optimizer:
 class SGD(Optimizer):
     """Stochastic gradient descent optimizer."""
 
-    def __init__(self, lr: float = 0.01) -> None:
+    def __init__(self, lr: float = 0.01, weight_decay: float = 0.0) -> None:
         if lr <= 0:
             raise ValueError(f"Learning rate must be > 0, got {lr}.")
+        if weight_decay < 0:
+            raise ValueError(f"weight_decay must be >= 0, got {weight_decay}.")
         self.lr = lr
+        self.weight_decay = weight_decay
 
     def step(
         self,
@@ -73,7 +76,10 @@ class SGD(Optimizer):
                 raise ValueError(
                     f"Parameter/gradient shape mismatch: param {param.shape}, grad {grad.shape}."
                 )
-            param -= self.lr * grad
+            g = grad
+            if self.weight_decay > 0.0:
+                g = g + self.weight_decay * param
+            param -= self.lr * g
 
 
 class Adam(Optimizer):
@@ -85,6 +91,7 @@ class Adam(Optimizer):
         beta1: float = 0.9,
         beta2: float = 0.999,
         eps: float = 1e-8,
+        weight_decay: float = 0.0,
     ) -> None:
         if lr <= 0:
             raise ValueError(f"Learning rate must be > 0, got {lr}.")
@@ -94,10 +101,13 @@ class Adam(Optimizer):
             raise ValueError(f"beta2 must be in (0, 1), got {beta2}.")
         if eps <= 0:
             raise ValueError(f"eps must be > 0, got {eps}.")
+        if weight_decay < 0:
+            raise ValueError(f"weight_decay must be >= 0, got {weight_decay}.")
         self.lr = lr
         self.beta1 = beta1
         self.beta2 = beta2
         self.eps = eps
+        self.weight_decay = weight_decay
         self.t = 0
         self.m: dict[int, np.ndarray] = {}
         self.v: dict[int, np.ndarray] = {}
@@ -138,6 +148,8 @@ class Adam(Optimizer):
                 self.v[key] = np.zeros_like(param, dtype=np.float32)
 
             g = grad.astype(np.float32, copy=False)
+            if self.weight_decay > 0.0:
+                g = g + self.weight_decay * param
             m = self.m[key]
             v = self.v[key]
             m[...] = self.beta1 * m + (1.0 - self.beta1) * g

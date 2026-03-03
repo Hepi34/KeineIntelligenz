@@ -235,6 +235,33 @@ class ReLU(Layer):
         return grad_output * self._mask
 
 
+class Dropout(Layer):
+    """Inverted dropout layer."""
+
+    def __init__(self, rate: float = 0.5) -> None:
+        if not (0.0 <= rate < 1.0):
+            raise ValueError(f"Dropout rate must be in [0, 1), got {rate}.")
+        self.rate = float(rate)
+        self._mask: np.ndarray | None = None
+        self._scale = np.float32(1.0 / max(1e-12, 1.0 - self.rate))
+
+    def forward(self, x: np.ndarray, training: bool = True) -> np.ndarray:
+        x = x.astype(np.float32, copy=False)
+        if not training or self.rate <= 0.0:
+            self._mask = None
+            return x
+        self._mask = (np.random.rand(*x.shape) >= self.rate).astype(np.float32)
+        return x * self._mask * self._scale
+
+    def backward(self, grad_output: np.ndarray) -> np.ndarray:
+        grad_output = grad_output.astype(np.float32, copy=False)
+        if self.rate <= 0.0:
+            return grad_output
+        if self._mask is None:
+            raise RuntimeError("Call forward(training=True) before backward.")
+        return grad_output * self._mask * self._scale
+
+
 class MaxPool2D(Layer):
     """2D max pooling for NCHW tensors."""
 

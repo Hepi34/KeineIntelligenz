@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from layers import Conv2D, Dense, Flatten, MaxPool2D, ReLU
+from layers import Conv2D, Dense, Dropout, Flatten, MaxPool2D, ReLU
 from model import CNNModel
 from opencl_backend import OpenCLManager, cl
 
@@ -236,6 +236,37 @@ __kernel void relu_backward(
     const int gid = get_global_id(0);
     if (gid >= n) return;
     grad_x[gid] = x[gid] > 0.0f ? grad_out[gid] : 0.0f;
+}
+
+__kernel void dropout_forward_train(
+    __global const float* x,
+    __global float* y,
+    __global float* mask,
+    const int n,
+    const float drop_rate,
+    const float scale,
+    const uint seed
+) {
+    const int gid = get_global_id(0);
+    if (gid >= n) return;
+    uint state = (uint)gid * 747796405u + seed * 2891336453u + 277803737u;
+    state = state * 747796405u + 2891336453u;
+    const float r = (float)(state & 0x00FFFFFFu) / 16777216.0f;
+    const float keep = (r >= drop_rate) ? 1.0f : 0.0f;
+    mask[gid] = keep;
+    y[gid] = x[gid] * keep * scale;
+}
+
+__kernel void dropout_backward(
+    __global const float* grad_out,
+    __global const float* mask,
+    __global float* grad_x,
+    const int n,
+    const float scale
+) {
+    const int gid = get_global_id(0);
+    if (gid >= n) return;
+    grad_x[gid] = grad_out[gid] * mask[gid] * scale;
 }
 
 __kernel void maxpool2x2_forward_nchw(
@@ -493,6 +524,7 @@ __kernel void sgd_update(
     __global float* param,
     __global const float* grad,
     const float lr,
+    const float weight_decay,
     const int n
 ) {
     const int gid = get_global_id(0);
@@ -501,6 +533,7 @@ __kernel void sgd_update(
     float g = grad[gid];
     if (!isfinite(p)) p = 0.0f;
     if (!isfinite(g)) g = 0.0f;
+    g += weight_decay * p;
     // Clip gradient to prevent explosion
     const float grad_clip = 10.0f;
     if (g > grad_clip) g = grad_clip;
@@ -518,6 +551,7 @@ __kernel void adam_update(
     __global float* m,
     __global float* v,
     const float lr,
+    const float weight_decay,
     const float beta1,
     const float beta2,
     const float eps,
@@ -533,6 +567,7 @@ __kernel void adam_update(
     float v_t = v[gid];
     if (!isfinite(p)) p = 0.0f;
     if (!isfinite(g)) g = 0.0f;
+    g += weight_decay * p;
     if (g > 10.0f) g = 10.0f;
     if (g < -10.0f) g = -10.0f;
 
@@ -572,7 +607,12 @@ class GPUTrainConfig:
     shuffle: bool = True
     use_second_conv: bool = False
     use_maxpool: bool = False
+    dropout_rate: float = 0.0
     optimizer: str = "sgd"
+    weight_decay: float = 0.0
+    lr_decay_after_epoch: int | None = None
+    lr_decay_factor: float = 1.0
+    restore_best: bool = False
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_eps: float = 1e-8
@@ -595,6 +635,10 @@ class GPUTrainingPipeline:
 
         self.use_second_conv = bool(config.use_second_conv)
         self.use_maxpool = bool(config.use_maxpool)
+        self.dropout_rate = float(config.dropout_rate)
+        if not (0.0 <= self.dropout_rate < 1.0):
+            raise ValueError(f"dropout_rate must be in [0, 1), got {self.dropout_rate}.")
+        self.use_dropout = self.dropout_rate > 0.0
         self.conv2_filters = int(config.conv2_filters if config.conv2_filters > 0 else config.conv_filters)
 
         self.c1_oh = (config.input_height + 2 * config.padding - config.kernel_size) // config.stride + 1
@@ -639,6 +683,8 @@ class GPUTrainingPipeline:
         self.k_conv2d_backward_input_nchw = cl.Kernel(self.program, "conv2d_backward_input_nchw")
         self.k_relu_forward = cl.Kernel(self.program, "relu_forward")
         self.k_relu_backward = cl.Kernel(self.program, "relu_backward")
+        self.k_dropout_forward_train = cl.Kernel(self.program, "dropout_forward_train")
+        self.k_dropout_backward = cl.Kernel(self.program, "dropout_backward")
         self.k_maxpool2x2_forward_nchw = cl.Kernel(self.program, "maxpool2x2_forward_nchw")
         self.k_maxpool2x2_backward_nchw = cl.Kernel(self.program, "maxpool2x2_backward_nchw")
         self.k_dense_forward = cl.Kernel(self.program, "dense_forward")
@@ -739,9 +785,12 @@ class GPUTrainingPipeline:
             "a_conv": self.manager.empty_device((batch_size, cfg.conv_filters, self.c1_oh, self.c1_ow), np.dtype(np.float32)),
             "z_fc1": self.manager.empty_device((batch_size, cfg.hidden_units), np.dtype(np.float32)),
             "a_fc1": self.manager.empty_device((batch_size, cfg.hidden_units), np.dtype(np.float32)),
+            "a_fc1_do": self.manager.empty_device((batch_size, cfg.hidden_units), np.dtype(np.float32)),
+            "drop_mask": self.manager.empty_device((batch_size, cfg.hidden_units), np.dtype(np.float32)),
             "logits": self.manager.empty_device((batch_size, cfg.num_classes), np.dtype(np.float32)),
             "d_logits": self.manager.empty_device((batch_size, cfg.num_classes), np.dtype(np.float32)),
             "d_a_fc1": self.manager.empty_device((batch_size, cfg.hidden_units), np.dtype(np.float32)),
+            "d_a_fc1_pre": self.manager.empty_device((batch_size, cfg.hidden_units), np.dtype(np.float32)),
             "d_z_fc1": self.manager.empty_device((batch_size, cfg.hidden_units), np.dtype(np.float32)),
             "d_a_conv": self.manager.empty_device((batch_size, self.flat_features), np.dtype(np.float32)),
             "d_z_conv": self.manager.empty_device((batch_size, cfg.conv_filters, self.c1_oh, self.c1_ow), np.dtype(np.float32)),
@@ -823,6 +872,19 @@ class GPUTrainingPipeline:
         snap["b_fc2"] = self.manager.from_device(self.b_fc2, (cfg.num_classes,), np.dtype(np.float32))
         return snap
 
+    def _load_parameter_snapshot(self, snap: dict[str, np.ndarray]) -> None:
+        q = self.manager.queue
+        cl.enqueue_copy(q, self.w_conv, np.ascontiguousarray(snap["w_conv"].astype(np.float32, copy=False)))
+        cl.enqueue_copy(q, self.b_conv, np.ascontiguousarray(snap["b_conv"].astype(np.float32, copy=False)))
+        if self.use_second_conv:
+            cl.enqueue_copy(q, self.w_conv2, np.ascontiguousarray(snap["w_conv2"].astype(np.float32, copy=False)))
+            cl.enqueue_copy(q, self.b_conv2, np.ascontiguousarray(snap["b_conv2"].astype(np.float32, copy=False)))
+        cl.enqueue_copy(q, self.w_fc1, np.ascontiguousarray(snap["w_fc1"].astype(np.float32, copy=False)))
+        cl.enqueue_copy(q, self.b_fc1, np.ascontiguousarray(snap["b_fc1"].astype(np.float32, copy=False)))
+        cl.enqueue_copy(q, self.w_fc2, np.ascontiguousarray(snap["w_fc2"].astype(np.float32, copy=False)))
+        cl.enqueue_copy(q, self.b_fc2, np.ascontiguousarray(snap["b_fc2"].astype(np.float32, copy=False)))
+        q.finish()
+
     @staticmethod
     def _finite_stats(name: str, arr: np.ndarray) -> str:
         finite = np.isfinite(arr)
@@ -892,7 +954,12 @@ class GPUTrainingPipeline:
             flatten = cpu_model.layers[idx]
             fc1 = cpu_model.layers[idx + 1]
             relu3 = cpu_model.layers[idx + 2]
-            fc2 = cpu_model.layers[idx + 3]
+            if self.use_dropout:
+                drop = cpu_model.layers[idx + 3]
+                fc2 = cpu_model.layers[idx + 4]
+            else:
+                drop = None
+                fc2 = cpu_model.layers[idx + 3]
 
             z_conv1 = conv1.forward(x, training=False)
             a_conv1 = relu1.forward(z_conv1, training=False)
@@ -902,7 +969,8 @@ class GPUTrainingPipeline:
             flat = flatten.forward(pooled, training=False)
             z_fc1 = fc1.forward(flat, training=False)
             a_fc1 = relu3.forward(z_fc1, training=False)
-            logits = fc2.forward(a_fc1, training=False)
+            a_fc1_do = drop.forward(a_fc1, training=False) if drop is not None else a_fc1
+            logits = fc2.forward(a_fc1_do, training=False)
             probs = self._stable_softmax(logits)
             return {
                 "z_conv": z_conv1.astype(np.float32, copy=False),
@@ -1291,6 +1359,7 @@ class GPUTrainingPipeline:
             n_cur=n_cur,
             sample_elems=sample_elems,
             buffers=buffers,
+            lr=self.cfg.learning_rate,
         )
 
         logits = self.manager.from_device(buffers["logits"], (n_cur, self.cfg.num_classes), np.dtype(np.float32))
@@ -1341,12 +1410,18 @@ class GPUTrainingPipeline:
         sample_elems = cfg.input_channels * cfg.input_height * cfg.input_width
         buffers = self._alloc_batch_buffers(batch)
         history: dict[str, list[float]] = {"loss": [], "accuracy": [], "epoch_time": []}
+        best_acc = -1.0
+        best_snapshot: dict[str, np.ndarray] | None = None
 
         num_train = x_train.shape[0]
         for epoch in range(1, cfg.epochs + 1):
             t0 = time.perf_counter()
             epoch_seen = 0
             self.k_set_f32_zero(self.manager.queue, (1,), None, buffers["loss_accum"])
+            epoch_lr = float(cfg.learning_rate)
+            if cfg.lr_decay_after_epoch is not None and epoch > cfg.lr_decay_after_epoch:
+                decay_steps = epoch - cfg.lr_decay_after_epoch
+                epoch_lr = float(cfg.learning_rate * (cfg.lr_decay_factor ** decay_steps))
 
             # Shuffle each epoch to avoid ordered-label collapse in SGD.
             if cfg.shuffle:
@@ -1368,6 +1443,7 @@ class GPUTrainingPipeline:
                     n_cur=n_cur,
                     sample_elems=sample_elems,
                     buffers=buffers,
+                    lr=epoch_lr,
                 )
 
                 self.k_reduce_sum_f32_single(
@@ -1404,9 +1480,14 @@ class GPUTrainingPipeline:
             history["loss"].append(float(avg_loss))
             history["accuracy"].append(float(accuracy))
             history["epoch_time"].append(float(sec))
+            if cfg.restore_best and accuracy > best_acc:
+                best_acc = float(accuracy)
+                best_snapshot = self._parameter_snapshot()
             if on_epoch is not None:
                 on_epoch(epoch, float(avg_loss), float(accuracy), float(sec), history)
 
+        if cfg.restore_best and best_snapshot is not None:
+            self._load_parameter_snapshot(best_snapshot)
         return history
 
     def _train_batch(
@@ -1417,6 +1498,7 @@ class GPUTrainingPipeline:
         n_cur: int,
         sample_elems: int,
         buffers: dict[str, Any],
+        lr: float,
     ) -> None:
         cfg = self.cfg
         q = self.manager.queue
@@ -1542,11 +1624,35 @@ class GPUTrainingPipeline:
             np.int32(fc1_total),
         )
 
+        fc2_input = buffers["a_fc1"]
+        if self.use_dropout:
+            drop_scale = np.float32(1.0 / max(1e-12, 1.0 - self.dropout_rate))
+            # Keep seed within signed 32-bit range to avoid Windows C-long conversion errors.
+            seed_i32 = (
+                (start + 1) * 1103515245
+                + n_cur * 12345
+                + (self._adam_step_count % 2147483647)
+            ) % 2147483647
+            drop_seed = np.uint32(seed_i32)
+            self.k_dropout_forward_train(
+                q,
+                (int(fc1_total),),
+                None,
+                buffers["a_fc1"],
+                buffers["a_fc1_do"],
+                buffers["drop_mask"],
+                np.int32(fc1_total),
+                np.float32(self.dropout_rate),
+                drop_scale,
+                drop_seed,
+            )
+            fc2_input = buffers["a_fc1_do"]
+
         self.k_dense_forward(
             q,
             (int(n_cur), int(cfg.num_classes)),
             None,
-            buffers["a_fc1"],
+            fc2_input,
             self.w_fc2,
             self.b_fc2,
             buffers["logits"],
@@ -1571,7 +1677,7 @@ class GPUTrainingPipeline:
             q,
             (int(cfg.hidden_units), int(cfg.num_classes)),
             None,
-            buffers["a_fc1"],
+            fc2_input,
             buffers["d_logits"],
             self.gw_fc2,
             np.int32(n_cur),
@@ -1599,11 +1705,26 @@ class GPUTrainingPipeline:
             np.int32(cfg.num_classes),
         )
 
+        relu_grad_in = buffers["d_a_fc1"]
+        if self.use_dropout:
+            drop_scale = np.float32(1.0 / max(1e-12, 1.0 - self.dropout_rate))
+            self.k_dropout_backward(
+                q,
+                (int(fc1_total),),
+                None,
+                buffers["d_a_fc1"],
+                buffers["drop_mask"],
+                buffers["d_a_fc1_pre"],
+                np.int32(fc1_total),
+                drop_scale,
+            )
+            relu_grad_in = buffers["d_a_fc1_pre"]
+
         self.k_relu_backward(
             q,
             (int(fc1_total),),
             None,
-            buffers["d_a_fc1"],
+            relu_grad_in,
             buffers["z_fc1"],
             buffers["d_z_fc1"],
             np.int32(fc1_total),
@@ -1786,7 +1907,7 @@ class GPUTrainingPipeline:
             np.int32(self.c1_ow),
         )
 
-        self._optimizer_step(cfg.learning_rate)
+        self._optimizer_step(lr)
         q.finish()
 
     def _optimizer_step(self, lr: float) -> None:
@@ -1835,6 +1956,7 @@ class GPUTrainingPipeline:
                 param,
                 grad,
                 np.float32(lr),
+                np.float32(self.cfg.weight_decay),
                 np.int32(n),
             )
 
@@ -1850,6 +1972,7 @@ class GPUTrainingPipeline:
                 m,
                 v,
                 np.float32(lr),
+                np.float32(self.cfg.weight_decay),
                 np.float32(beta1),
                 np.float32(beta2),
                 np.float32(eps),
@@ -2056,9 +2179,11 @@ class GPUTrainingPipeline:
                     Flatten(),
                     Dense(in_features=self.flat_features, out_features=cfg.hidden_units),
                     ReLU(),
-                    Dense(in_features=cfg.hidden_units, out_features=cfg.num_classes),
                 ]
             )
+            if self.use_dropout:
+                layers.append(Dropout(rate=self.dropout_rate))
+            layers.append(Dense(in_features=cfg.hidden_units, out_features=cfg.num_classes))
             model = CNNModel(layers)
         else:
             model = CNNModel(
