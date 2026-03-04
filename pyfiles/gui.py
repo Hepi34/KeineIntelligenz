@@ -6,6 +6,8 @@ import sys
 import time
 import os
 import re
+import platform
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -353,6 +355,69 @@ PRESETS: dict[str, Preset] = {
         restore_best=True,
     ),
 }
+
+
+def _sanitize_hardware_name(name: str) -> str:
+    """Convert hardware names like 'RTX 5080' into filename-safe 'RTX5080'."""
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "", name)
+    return cleaned or "Unknown"
+
+
+def _detect_cpu_name() -> str:
+    """Best-effort CPU marketing name for filename labeling."""
+    candidates: list[str] = []
+
+    # macOS provides the most useful brand string through sysctl.
+    if sys.platform == "darwin":
+        try:
+            brand = subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            if brand:
+                candidates.append(brand)
+        except Exception:
+            pass
+
+        # Apple Silicon fallback where brand string can be generic/empty.
+        try:
+            arm_brand = subprocess.check_output(
+                ["sysctl", "-n", "hw.optional.arm64"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            if arm_brand == "1":
+                candidates.append("Apple Silicon")
+        except Exception:
+            pass
+
+    candidates.extend(
+        [
+            platform.processor(),
+            platform.machine(),
+        ]
+    )
+
+    for candidate in candidates:
+        if candidate and candidate.lower() not in {"unknown", "arm64", "x86_64"}:
+            return candidate
+    for candidate in candidates:
+        if candidate:
+            return candidate
+    return "UnknownCPU"
+
+
+def _format_eta_seconds(total_seconds: float) -> str:
+    """Format remaining time as a compact ETA string."""
+    secs = max(0, int(round(total_seconds)))
+    hours, rem = divmod(secs, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m {seconds:02d}s"
+    if minutes > 0:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
 
 
 def build_model(preset: Preset) -> CNNModel:
@@ -788,6 +853,7 @@ class MainWindow(QMainWindow):
 
         self.acc_label = QLabel("Accuracy: -")
         self.time_label = QLabel("Seconds per epoch: -")
+        self.eta_label = QLabel("ETA: -")
         self.model_file_label = QLabel("Model file: -")
         self.preset_details_label = QLabel("")
         self.preset_details_label.setWordWrap(True)
@@ -816,6 +882,7 @@ class MainWindow(QMainWindow):
         form.addRow("Progress", self.progress)
         form.addRow("", self.acc_label)
         form.addRow("", self.time_label)
+        form.addRow("", self.eta_label)
         form.addRow("", self.model_file_label)
         form.addRow("Train Images", self._file_row(self.train_images_edit, self.pick_train_images))
         form.addRow("Train Labels", self._file_row(self.train_labels_edit, self.pick_train_labels))
@@ -864,6 +931,7 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.acc_label.setText("Accuracy: -")
         self.time_label.setText("Seconds per epoch: -")
+        self.eta_label.setText("ETA: -")
         self._draw_history({"loss": [], "accuracy": [], "epoch_time": []})
 
         self._thread = QThread()
@@ -897,11 +965,21 @@ class MainWindow(QMainWindow):
         self.progress.setValue(pct)
         self.acc_label.setText(f"Accuracy: {accuracy * 100:.2f}%")
         self.time_label.setText(f"Seconds per epoch: {sec:.2f}s")
+        epoch_times: list[float] = []
+        if isinstance(history, dict):
+            maybe_times = history.get("epoch_time", [])
+            if isinstance(maybe_times, list):
+                epoch_times = [float(t) for t in maybe_times]
+        avg_epoch_sec = float(np.mean(epoch_times)) if epoch_times else float(sec)
+        remaining_epochs = max(0, self._active_total_epochs - epoch)
+        eta_sec = remaining_epochs * avg_epoch_sec
+        self.eta_label.setText(f"ETA: {_format_eta_seconds(eta_sec)}")
         self._draw_history(history)
 
     def on_finished(self, history: object, model: object) -> None:
         self.start_btn.setEnabled(True)
         self.progress.setValue(100)
+        self.eta_label.setText("ETA: 0s")
         self._draw_history(history)
         if isinstance(model, CNNModel):
             self.current_model = model
@@ -909,7 +987,13 @@ class MainWindow(QMainWindow):
             version = preset.version if preset is not None else "vX"
             model_name = (preset.name if preset is not None else "Model").lower()
             device_name = self._active_device_key
-            file_name = f"{version}{model_name}{device_name}.npz"
+            if device_name == "GPU":
+                gpu_name = self.opencl_manager.info.device_name if self.opencl_manager is not None else "UnknownGPU"
+                hardware_name = _sanitize_hardware_name(gpu_name)
+            else:
+                hardware_name = _sanitize_hardware_name(_detect_cpu_name())
+            device_label = f"{device_name}_{hardware_name}"
+            file_name = f"{version}{model_name}{device_label}.npz"
             default_save_dir = Path(__file__).resolve().parent.parent / "models"
             default_save_dir.mkdir(parents=True, exist_ok=True)
             default_save_path = default_save_dir / file_name
@@ -920,6 +1004,8 @@ class MainWindow(QMainWindow):
                         "preset_key": self._active_preset_key or "",
                         "version": version,
                         "device": device_name,
+                        "device_label": device_label,
+                        "hardware_name": hardware_name,
                     },
                 )
                 self.current_model_path = default_save_path
@@ -933,6 +1019,7 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(True)
         self.load_btn.setEnabled(True)
         self.eval_btn.setEnabled(True)
+        self.eta_label.setText("ETA: -")
         QMessageBox.critical(self, "Training Error", message)
     
     def _on_thread_finished(self) -> None:
