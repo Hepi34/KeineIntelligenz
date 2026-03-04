@@ -1,6 +1,13 @@
 # KeineIntelligenz
 
 ## Introduction
-Dies ist eine KI, nämlicht keine Intelligenz. Dieses Projekt umfasst ein CNN-Modell, welches handgeschriebene Nummern erkennen soll. Es wurde mit einem 63k-Dataset von MNIST-Nummern gelernt.
+This is KeineIntelligenz, a program which is designed to train a CNN using MNIST datasets. It is made using Python. Both training on CPU as well as on GPU using PyOpenCV are supported. The program was tested on both Windows and MacOS, but should work on Linux as well.
 
-CNN-Model to recognize MNIST numbers
+## Usage
+To use the program, first clone this repository, then simply run the `start.py` file. If needed, it will automatically create a virtual environment and install the required dependencies. After that, the main GUI will open. 
+
+## GUI
+
+
+## Code documentation
+
