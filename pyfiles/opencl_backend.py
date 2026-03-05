@@ -1,3 +1,5 @@
+# Hepi34, onatic07, fritziii, 2026-03-06
+
 """PyOpenCL setup helpers for device detection and tensor buffer transfer."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# Hepi34, Onatic07, fritziii, 2026-03-06
+
 """MNIST dataset loading and normalization utilities."""
 
 from __future__ import annotations

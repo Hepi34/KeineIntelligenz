@@ -1,4 +1,6 @@
-"""PyQt6 GUI for CPU-only MNIST CNN training."""
+# Hepi34, onatic07, fritziii, 2026-03-06
+
+"""PyQt6 GUI for MNIST CNN training."""
 
 from __future__ import annotations
 

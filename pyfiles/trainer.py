@@ -1,3 +1,5 @@
+# Hepi34, onatic07, fritziii, 2026-03-06
+
 """Training loop orchestration."""
 
 from __future__ import annotations

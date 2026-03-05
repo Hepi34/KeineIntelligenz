@@ -1,3 +1,5 @@
+# Hepi34, onatic07, fritziii, 2026-03-06
+
 """Training and evaluation helper utilities."""
 
 from __future__ import annotations

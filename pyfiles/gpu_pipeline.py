@@ -1,3 +1,5 @@
+# Hepi34, onatic07, fritziii, 2026-03-06
+
 """End-to-end OpenCL training pipeline for MNIST CNN (GPU-only math path)."""
 
 from __future__ import annotations

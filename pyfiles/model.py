@@ -1,3 +1,5 @@
+# Hepi34, onatic07, fritziii, 2026-03-06
+
 """CNN model definition and orchestration logic."""
 
 from __future__ import annotations
