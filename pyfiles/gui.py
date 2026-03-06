@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QSpinBox,
     QTableWidget,
@@ -781,8 +782,9 @@ class DrawingWindow(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("MNIST CNN Trainer (by Hepi34, ontaic07 and fritziii)")
-        self.resize(920, 620)
+        self.setWindowTitle("MNIST CNN Trainer (by Hepi34, Onatic07 and fritziii)")
+        self.resize(1200, 760)
+        self.setMinimumSize(1080, 700)
 
         self._thread: QThread | None = None
         self._worker: QObject | None = None
@@ -1093,14 +1095,43 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No Model", "Train or load a model first.")
             return
 
+        progress_dialog: QProgressDialog | None = None
         try:
             x_test, y_test = self._get_test_data()
-            logits = self.current_model.forward(x_test, training=False)
-            pred = np.argmax(logits, axis=1)
+            total = int(x_test.shape[0])
+            if total <= 0:
+                raise RuntimeError("Test set is empty.")
+
+            progress_dialog = QProgressDialog("Evaluating on test set...", "Cancel", 0, total, self)
+            progress_dialog.setWindowTitle("Evaluating")
+            progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            progress_dialog.setMinimumDuration(0)
+            progress_dialog.setValue(0)
+
+            preset = self._current_preset()
+            batch_size = max(1, int(preset.batch_size) if preset is not None else 256)
+            pred_chunks: list[np.ndarray] = []
+
+            for start in range(0, total, batch_size):
+                end = min(total, start + batch_size)
+                logits = self.current_model.forward(x_test[start:end], training=False)
+                pred_chunks.append(np.argmax(logits, axis=1))
+                progress_dialog.setValue(end)
+                QApplication.processEvents()
+                if progress_dialog.wasCanceled():
+                    self.acc_label.setText("Accuracy: -")
+                    QMessageBox.information(self, "Evaluation", "Evaluation canceled.")
+                    return
+
+            pred = np.concatenate(pred_chunks, axis=0)
             accuracy = float(np.mean(pred == y_test))
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Evaluation Error", str(exc))
             return
+        finally:
+            if progress_dialog is not None:
+                progress_dialog.setValue(progress_dialog.maximum())
+                progress_dialog.close()
 
         self.acc_label.setText(f"Accuracy: {accuracy * 100:.2f}%")
         self._show_test_eval_table(y_true=y_test, y_pred=pred, total_accuracy=accuracy)
