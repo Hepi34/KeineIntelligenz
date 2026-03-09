@@ -779,94 +779,6 @@ class DrawingWindow(QWidget):
                 bar.setValue(0)
 
 
-class TrainingWindow(QMainWindow):
-    """Separate window for displaying training progress and graph."""
-    
-    def __init__(self, parent: QMainWindow | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Training Progress")
-        self.resize(900, 600)
-        
-        # Progress bar at the top
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        
-        # Info labels
-        info_widget = QWidget()
-        info_layout = QHBoxLayout(info_widget)
-        self.acc_label = QLabel("Accuracy: -")
-        self.time_label = QLabel("Seconds per epoch: -")
-        self.eta_label = QLabel("ETA: -")
-        info_layout.addWidget(self.acc_label)
-        info_layout.addWidget(self.time_label)
-        info_layout.addWidget(self.eta_label)
-        
-        # Graph
-        self.figure = Figure(figsize=(8, 5), tight_layout=True)
-        self.canvas = FigureCanvas(self.figure)
-        self.ax_loss = self.figure.add_subplot(111)
-        self.ax_acc = self.ax_loss.twinx()
-        self.ax_loss.set_xlabel("Epoch")
-        self.ax_loss.set_ylabel("Loss")
-        self.ax_acc.set_ylabel("Accuracy")
-        
-        # Layout
-        layout = QVBoxLayout()
-        layout.addWidget(self.progress)
-        layout.addWidget(info_widget)
-        layout.addWidget(self.canvas, stretch=1)
-        
-        widget = QWidget()
-        widget.setLayout(layout)
-        self.setCentralWidget(widget)
-    
-    def update_progress(self, epoch: int, loss: float, accuracy: float, sec: float, total_epochs: int, history: object) -> None:
-        """Update progress bar, labels, and graph."""
-        pct = int((epoch / max(1, total_epochs)) * 100)
-        self.progress.setValue(pct)
-        self.acc_label.setText(f"Accuracy: {accuracy * 100:.2f}%")
-        self.time_label.setText(f"Seconds per epoch: {sec:.2f}s")
-        
-        # Calculate ETA
-        epoch_times: list[float] = []
-        if isinstance(history, dict):
-            maybe_times = history.get("epoch_time", [])
-            if isinstance(maybe_times, list):
-                epoch_times = [float(t) for t in maybe_times]
-        avg_epoch_sec = float(np.mean(epoch_times)) if epoch_times else float(sec)
-        remaining_epochs = max(0, total_epochs - epoch)
-        eta_sec = remaining_epochs * avg_epoch_sec
-        self.eta_label.setText(f"ETA: {_format_eta_seconds(eta_sec)}")
-        
-        self._draw_history(history)
-    
-    def _draw_history(self, history_obj: object) -> None:
-        """Update the training graph."""
-        history = history_obj if isinstance(history_obj, dict) else {}
-        loss = history.get("loss", [])
-        accuracy = history.get("accuracy", [])
-        epochs = np.arange(1, len(loss) + 1)
-
-        self.ax_loss.clear()
-        self.ax_acc.clear()
-        self.ax_loss.set_xlabel("Epoch")
-        self.ax_loss.set_ylabel("Loss")
-        self.ax_acc.set_ylabel("Accuracy")
-
-        if len(epochs) > 0:
-            self.ax_loss.plot(epochs, loss, color="#1f77b4", marker="o", label="Loss")
-            self.ax_acc.plot(epochs, accuracy, color="#d62728", marker="s", label="Accuracy")
-            self.ax_acc.set_ylim(0.0, 1.0)
-
-        self.canvas.draw_idle()
-    
-    def finish_training(self) -> None:
-        """Called when training finishes."""
-        self.progress.setValue(100)
-        self.eta_label.setText("ETA: 0s")
-
-
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -886,7 +798,6 @@ class MainWindow(QMainWindow):
         self._drawing_window: DrawingWindow | None = None
         self.opencl_manager: OpenCLManager | None = OpenCLManager.create()
         self._gpu_probe_buffer: object | None = None
-        self._training_window: TrainingWindow | None = None
 
         default_dir = Path(__file__).resolve().parent.parent / "dataset" / "mnist-dataset"
         self.train_images_default = default_dir / "train-images.idx3.ubyte"
@@ -940,6 +851,13 @@ class MainWindow(QMainWindow):
         self.draw_btn = QPushButton("Open Drawing Window")
         self.draw_btn.clicked.connect(self.open_drawing_window)
 
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+
+        self.acc_label = QLabel("Accuracy: -")
+        self.time_label = QLabel("Seconds per epoch: -")
+        self.eta_label = QLabel("ETA: -")
         self.model_file_label = QLabel("Model file: -")
         self.preset_details_label = QLabel("")
         self.preset_details_label.setWordWrap(True)
@@ -965,13 +883,29 @@ class MainWindow(QMainWindow):
         form.addRow("", self.load_btn)
         form.addRow("", self.eval_btn)
         form.addRow("", self.draw_btn)
+        form.addRow("Progress", self.progress)
+        form.addRow("", self.acc_label)
+        form.addRow("", self.time_label)
+        form.addRow("", self.eta_label)
         form.addRow("", self.model_file_label)
         form.addRow("Train Images", self._file_row(self.train_images_edit, self.pick_train_images))
         form.addRow("Train Labels", self._file_row(self.train_labels_edit, self.pick_train_labels))
         form.addRow("Test Images", self._file_row(self.test_images_edit, self.pick_test_images))
         form.addRow("Test Labels", self._file_row(self.test_labels_edit, self.pick_test_labels))
 
-        self.setCentralWidget(controls)
+        self.figure = Figure(figsize=(6, 4), tight_layout=True)
+        self.canvas = FigureCanvas(self.figure)
+        self.ax_loss = self.figure.add_subplot(111)
+        self.ax_acc = self.ax_loss.twinx()
+        self.ax_loss.set_xlabel("Epoch")
+        self.ax_loss.set_ylabel("Loss")
+        self.ax_acc.set_ylabel("Accuracy")
+
+        root = QWidget()
+        layout = QHBoxLayout(root)
+        layout.addWidget(controls, stretch=0)
+        layout.addWidget(self.canvas, stretch=1)
+        self.setCentralWidget(root)
 
     def start_training(self) -> None:
         if self._thread is not None and self._thread.isRunning():
@@ -995,13 +929,14 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Dataset Missing", "Missing file(s):\n" + "\n".join(missing))
             return
 
-        # Create and show training window
-        self._training_window = TrainingWindow(self)
-        self._training_window.show()
-
         self.start_btn.setEnabled(False)
         self.load_btn.setEnabled(False)
         self.eval_btn.setEnabled(False)
+        self.progress.setValue(0)
+        self.acc_label.setText("Accuracy: -")
+        self.time_label.setText("Seconds per epoch: -")
+        self.eta_label.setText("ETA: -")
+        self._draw_history({"loss": [], "accuracy": [], "epoch_time": []})
 
         self._thread = QThread()
         if self.device_combo.currentIndex() == 1:
@@ -1030,14 +965,26 @@ class MainWindow(QMainWindow):
         self._thread.start()
 
     def on_progress(self, epoch: int, loss: float, accuracy: float, sec: float, history: object) -> None:
-        if self._training_window is not None:
-            self._training_window.update_progress(epoch, loss, accuracy, sec, self._active_total_epochs, history)
-
+        pct = int((epoch / max(1, self._active_total_epochs)) * 100)
+        self.progress.setValue(pct)
+        self.acc_label.setText(f"Accuracy: {accuracy * 100:.2f}%")
+        self.time_label.setText(f"Seconds per epoch: {sec:.2f}s")
+        epoch_times: list[float] = []
+        if isinstance(history, dict):
+            maybe_times = history.get("epoch_time", [])
+            if isinstance(maybe_times, list):
+                epoch_times = [float(t) for t in maybe_times]
+        avg_epoch_sec = float(np.mean(epoch_times)) if epoch_times else float(sec)
+        remaining_epochs = max(0, self._active_total_epochs - epoch)
+        eta_sec = remaining_epochs * avg_epoch_sec
+        self.eta_label.setText(f"ETA: {_format_eta_seconds(eta_sec)}")
+        self._draw_history(history)
 
     def on_finished(self, history: object, model: object) -> None:
-        if self._training_window is not None:
-            self._training_window.finish_training()
         self.start_btn.setEnabled(True)
+        self.progress.setValue(100)
+        self.eta_label.setText("ETA: 0s")
+        self._draw_history(history)
         if isinstance(model, CNNModel):
             self.current_model = model
             preset = PRESETS.get(self._active_preset_key or "")
@@ -1076,6 +1023,7 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(True)
         self.load_btn.setEnabled(True)
         self.eval_btn.setEnabled(True)
+        self.eta_label.setText("ETA: -")
         QMessageBox.critical(self, "Training Error", message)
     
     def _on_thread_finished(self) -> None:
@@ -1212,6 +1160,24 @@ class MainWindow(QMainWindow):
         self._drawing_window.raise_()
         self._drawing_window.activateWindow()
 
+    def _draw_history(self, history_obj: object) -> None:
+        history = history_obj if isinstance(history_obj, dict) else {}
+        loss = history.get("loss", [])
+        accuracy = history.get("accuracy", [])
+        epochs = np.arange(1, len(loss) + 1)
+
+        self.ax_loss.clear()
+        self.ax_acc.clear()
+        self.ax_loss.set_xlabel("Epoch")
+        self.ax_loss.set_ylabel("Loss")
+        self.ax_acc.set_ylabel("Accuracy")
+
+        if len(epochs) > 0:
+            self.ax_loss.plot(epochs, loss, color="#1f77b4", marker="o", label="Loss")
+            self.ax_acc.plot(epochs, accuracy, color="#d62728", marker="s", label="Accuracy")
+            self.ax_acc.set_ylim(0.0, 1.0)
+
+        self.canvas.draw_idle()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         if self._thread is not None and self._thread.isRunning():
