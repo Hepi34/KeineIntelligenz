@@ -160,14 +160,9 @@ Both can be used by passing them to the Trainer along with a learning rate.
 
 Helper functions and utilities used throughout training:
 
-- **accuracy_score()** - Calculates how many predictions are correct:
-  - Compares predicted class with true class
-  - Returns percentage of correct predictions
+- **accuracy_score()** - Computes classification accuracy from predicted labels and true labels.
 
-- **batch_iterator()** - Creates mini-batches for training:
-  - Splits training data into smaller chunks (batches)
-  - Can shuffle data randomly before batching
-  - Yields one batch at a time so you don't need to load everything at once
+- **batch_iterator()** - Creates mini-batches from training data, optionally shuffling before batching.
 
 - **Timer** - Simple utility to measure how long things take:
   - `start()` - begin timing
@@ -214,9 +209,8 @@ When the program starts, it tries to detect a GPU. If one is found, the GUI can 
 
 #### pyfiles/opencl_layers.py
 
-GPU versions of neural network layers using OpenCL. Instead of NumPy running on CPU, these layers:
-- Run entirely on the GPU for speed
-- Contain OpenCL kernels (GPU code) for each operation
-- Are used by GPUTrainingPipeline instead of the regular CPU layers
-- Include GPU versions of Conv2D, Dense, ReLU, MaxPool2D, and other operations
-- Handle memory management between CPU and GPU
+A small helper module for OpenCL-backed layer implementations.
+
+- Provides an `OpenCLConv2D` layer that runs a Conv2D forward pass on the GPU via a compiled OpenCL kernel
+- Includes a minimal OpenCL kernel for Conv2D; it does not implement full backward passes or other layer types (Dense/ReLU/MaxPool) in this module
+- Intended as a building block for GPU-accelerated operations, but the main GPU training pipeline is in `pyfiles/gpu_pipeline.py`

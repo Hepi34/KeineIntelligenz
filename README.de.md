@@ -160,14 +160,9 @@ Beide können an den Trainer übergeben werden, zusammen mit einer Lernrate.
 
 Hilfsfunktionen und Utilities, die im Training genutzt werden:
 
-- **accuracy_score()** - Berechnet, wie viele Vorhersagen korrekt sind:
-  - Vergleicht vorhergesagte Klasse mit dem wahren Label
-  - Gibt den Prozentanteil korrekter Vorhersagen zurück
+- **accuracy_score()** - Berechnet die Klassifikationsgenauigkeit aus vorhergesagten und echten Labels.
 
-- **batch_iterator()** - Erstellt Mini-Batches fürs Training:
-  - Teilt Trainingsdaten in kleinere Batches auf
-  - Kann Daten vor dem Batching zufällig mischen
-  - Liefert ein Batch nach dem anderen, damit nicht alles auf einmal geladen werden muss
+- **batch_iterator()** - Erstellt Mini-Batches aus Trainingsdaten, optional mit vorherigem Mischen.
 
 - **Timer** - Einfache Utility zum Messen von Laufzeiten:
   - `start()` - Startet die Zeitmessung
@@ -214,9 +209,8 @@ Beim Programmstart wird versucht, eine GPU zu erkennen. Wenn eine gefunden wird,
 
 #### pyfiles/opencl_layers.py
 
-GPU-Versionen der neuronalen Layer mit OpenCL. Statt NumPy auf der CPU laufen diese Layer:
-- Vollstaendig auf der GPU fuer Geschwindigkeit
-- Enthalten OpenCL-Kernel (GPU-Code) fuer jede Operation
-- Werden von der GPUTrainingPipeline statt der normalen CPU-Layer genutzt
-- Enthalten GPU-Versionen von Conv2D, Dense, ReLU, MaxPool2D und weiteren Operationen
-- Verwalten Speichertransfer zwischen CPU und GPU
+Ein kleines Hilfsmodul für OpenCL-basierte Layer-Implementierungen.
+
+- Stellt einen `OpenCLConv2D`-Layer bereit, der einen Conv2D-Forward-Pass auf der GPU via OpenCL-Kernel ausführt
+- Enthält einen minimalen OpenCL-Kernel für Conv2D; es gibt keinen vollständigen Backward-Pass und keine zusätzlichen Layer (Dense/ReLU/MaxPool) in diesem Modul
+- Dient als Baustein für GPU-beschleunigte Operationen, während die Haupt-GPU-Trainingslogik in `pyfiles/gpu_pipeline.py` liegt
