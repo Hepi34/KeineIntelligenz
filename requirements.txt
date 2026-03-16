@@ -1,0 +1,4 @@
+pyopencl
+numpy
+matplotlib
+pyqt6
